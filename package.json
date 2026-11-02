@@ -9,7 +9,10 @@
     "dev": "nodemon --exec node --loader ts-node/esm src/index.ts",
     "build": "tsc",
     "deploy": "node --loader ts-node/esm src/deploy-commands.ts",
-    "lint": "eslint src"
+    "format": "prettier --write \"src/**/*.ts\"",
+    "lint": "eslint src",
+    "lint:fix": "eslint src --fix",
+    "prepare": "git config core.hooksPath .githooks || exit 0"
   },
   "dependencies": {
     "@discordjs/voice": "^0.19.2",

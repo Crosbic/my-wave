@@ -1,0 +1,11 @@
+services:
+  my-wave:
+    image: ghcr.io/crosbic/ympb-player-bot:master
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - my-wave-data:/app/data
+
+volumes:
+  my-wave-data:
+    name: my-wave-data

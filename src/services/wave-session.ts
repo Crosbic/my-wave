@@ -31,7 +31,8 @@ import {
   VoiceConnectionStatus
 } from '@discordjs/voice'
 
-import { StationFeedback, YandexAuthError, YandexMusicService } from './yandex-music.service.js'
+import { StationFeedback, YandexMusicService } from './yandex-music.service.js'
+import { YandexAuthError } from '../errors/yandexAuthError.js'
 import { IYandexTrack } from '../types/yandexTrack.js'
 import { describeError, UserFacingError } from '../utils/errors.js'
 

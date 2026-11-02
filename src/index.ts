@@ -10,7 +10,6 @@ import config from './config.js'
 import { DatabaseService } from './services/database.service.js'
 import { PlayerService } from './services/player.service.js'
 import { describeError } from './utils/errors.js'
-import { respond } from './utils/interactions.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -68,29 +67,6 @@ for (const file of eventFiles) {
     client.on(event.name, (...args) => event.execute(...args))
   }
 }
-
-client.on(Events.InteractionCreate, async interaction => {
-  if (interaction.isButton()) {
-    await playerService.handleButton(interaction)
-    return
-  }
-
-  if (!interaction.isChatInputCommand()) return
-
-  const command = client.commands.get(interaction.commandName)
-
-  if (!command) {
-    console.error(`Команда ${interaction.commandName} не найдена.`)
-    return
-  }
-
-  try {
-    await command.execute(interaction)
-  } catch (error) {
-    console.error(`Ошибка при выполнении команды /${interaction.commandName}:`, describeError(error))
-    await respond(interaction, 'Произошла ошибка при выполнении команды!')
-  }
-})
 
 // Без этих обработчиков любая необработанная ошибка в обработчике событий завершает процесс
 client.on(Events.Error, error => {

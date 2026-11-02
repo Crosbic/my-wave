@@ -2,6 +2,7 @@ import crypto from 'crypto'
 
 import axios, { isAxiosError } from 'axios'
 
+import { YandexAuthError } from '../errors/yandexAuthError.js'
 import { IUserData } from '../types/userData.js'
 import { IStationBatch, IYandexTrack } from '../types/yandexTrack.js'
 import { describeError } from '../utils/errors.js'
@@ -12,16 +13,6 @@ const REQUEST_TIMEOUT = 15_000
 // Соль для подписи прямой ссылки на файл, как в эталонном клиенте MarshalX/yandex-music-api
 const SIGN_SALT = 'XGRlBW9FXlekgbPrRHuSiA'
 const FEEDBACK_FROM = 'ym-player-bot'
-
-/**
- * Яндекс отклонил токен: он истёк или был отозван
- */
-export class YandexAuthError extends Error {
-  constructor() {
-    super('Токен Яндекса недействителен или истёк')
-    this.name = 'YandexAuthError'
-  }
-}
 
 /**
  * Фидбэк станции. batchId передаётся как batch-id и должен отсутствовать для radioStarted

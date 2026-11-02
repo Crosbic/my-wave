@@ -4,7 +4,8 @@ import { ButtonInteraction, GuildTextBasedChannel, PermissionFlagsBits, User, Vo
 
 import { DatabaseService } from './database.service.js'
 import { stoppedEmbed, WAVE_BUTTON_PREFIX, WaveAction, WaveSession } from './wave-session.js'
-import { YandexAuthError, YandexMusicService } from './yandex-music.service.js'
+import { YandexMusicService } from './yandex-music.service.js'
+import { YandexAuthError } from '../errors/yandexAuthError.js'
 import { describeError, UserFacingError } from '../utils/errors.js'
 import { LONG_NOTICE_TTL, notify, SHORT_NOTICE_TTL } from '../utils/interactions.js'
 import { isBotAdmin } from '../utils/permissions.js'

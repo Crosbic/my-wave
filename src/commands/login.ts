@@ -1,7 +1,8 @@
 import { ChatInputCommandInteraction, MessageFlags, SlashCommandBuilder } from 'discord.js'
 
+import { YandexAuthError } from '../errors/yandexAuthError.js'
 import { DatabaseService } from '../services/database.service.js'
-import { YandexAuthError, YandexMusicService } from '../services/yandex-music.service.js'
+import { YandexMusicService } from '../services/yandex-music.service.js'
 import { describeError } from '../utils/errors.js'
 import { LONG_NOTICE_TTL, respond } from '../utils/interactions.js'
 
