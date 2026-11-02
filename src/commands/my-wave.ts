@@ -3,7 +3,7 @@ import { ChatInputCommandInteraction, MessageFlags, PermissionFlagsBits, SlashCo
 import { DatabaseService } from '../services/database.service.js'
 import { PlayerService } from '../services/player.service.js'
 import { UserFacingError } from '../utils/errors.js'
-import { respond } from '../utils/interactions.js'
+import { dismiss, respond } from '../utils/interactions.js'
 
 export const data = new SlashCommandBuilder()
   .setName('my-wave')
@@ -60,8 +60,6 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     return
   }
 
-  await respond(interaction, `Подключаюсь к голосовому каналу «${voiceChannel.name}»...`)
-
   try {
     await PlayerService.getInstance().startWave({
       user: interaction.user,
@@ -70,7 +68,8 @@ export async function execute(interaction: ChatInputCommandInteraction) {
       yandexId: userData.userInfo.id,
       accessToken: userData.accessToken
     })
-    await respond(interaction, `«Моя волна» запущена в канале «${voiceChannel.name}».`)
+    // Подтверждение не нужно: в канале уже появился плеер
+    await dismiss(interaction)
   } catch (error) {
     if (error instanceof UserFacingError) {
       await respond(interaction, error.message)

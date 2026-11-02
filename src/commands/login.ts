@@ -3,7 +3,7 @@ import { ChatInputCommandInteraction, MessageFlags, SlashCommandBuilder } from '
 import { DatabaseService } from '../services/database.service.js'
 import { YandexAuthError, YandexMusicService } from '../services/yandex-music.service.js'
 import { describeError } from '../utils/errors.js'
-import { respond } from '../utils/interactions.js'
+import { LONG_NOTICE_TTL, respond } from '../utils/interactions.js'
 
 export const data = new SlashCommandBuilder()
   .setName('login')
@@ -46,10 +46,12 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   const wasAuthorized = db.hasUserToken(userId)
   db.saveUserToken(userId, token, userInfo)
 
+  // Подтверждение нужно (больше ничего не меняется), но держать его в чате незачем
   await respond(
     interaction,
     wasAuthorized
       ? `Токен обновлён! Вы вошли как ${userInfo.nickName}.`
-      : `Авторизация успешно завершена! Вы вошли как ${userInfo.nickName}. Теперь вы можете использовать команды бота.`
+      : `Авторизация успешно завершена! Вы вошли как ${userInfo.nickName}. Теперь вы можете использовать команды бота.`,
+    LONG_NOTICE_TTL
   )
 }

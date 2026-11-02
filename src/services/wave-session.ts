@@ -179,7 +179,10 @@ export class WaveSession {
 
     let message: Message
     try {
-      message = await textChannel.send({ embeds: [loadingEmbed()], components: [controlsRow(false)] })
+      message = await textChannel.send({
+        embeds: [loadingEmbed()],
+        components: [controlsRow({ paused: false, hasTrack: false, hasPrevious: false })]
+      })
     } catch (error) {
       console.error(`[${guildId}] Не удалось отправить сообщение плеера:`, describeError(error))
       destroyConnection(connection)
@@ -244,19 +247,24 @@ export class WaveSession {
   }
 
   pause(): boolean {
-    if (this.destroyed || !this.player.pause()) {
+    if (this.destroyed) {
       return false
     }
+
+    const paused = this.player.pause()
+    // Перерисовываем и при неудаче, чтобы кнопка показала настоящее состояние плеера
     this.render()
-    return true
+    return paused
   }
 
   resume(): boolean {
-    if (this.destroyed || !this.player.unpause()) {
+    if (this.destroyed) {
       return false
     }
+
+    const resumed = this.player.unpause()
     this.render()
-    return true
+    return resumed
   }
 
   /**
@@ -322,6 +330,12 @@ export class WaveSession {
       this.current = null
     }
     this.failedTracks = reason === 'error' ? this.failedTracks + 1 : 0
+
+    if (reason === 'skip') {
+      // Нажатие ⏭️ должно ощущаться сразу: глушим трек и показываем загрузку, пока получаем следующий
+      this.player.stop(true)
+      this.render()
+    }
 
     while (!this.destroyed) {
       if (this.failedTracks >= MAX_FAILED_TRACKS) {
@@ -590,8 +604,12 @@ export class WaveSession {
     }
 
     const track = this.current?.item.track
-    const paused = this.player.state.status === AudioPlayerStatus.Paused
-    return { embeds: [track ? nowPlayingEmbed(track) : loadingEmbed()], components: [controlsRow(paused)] }
+    const controls = controlsRow({
+      paused: this.player.state.status === AudioPlayerStatus.Paused,
+      hasTrack: !!track,
+      hasPrevious: this.history.length > 0
+    })
+    return { embeds: [track ? nowPlayingEmbed(track) : loadingEmbed()], components: [controls] }
   }
 
   private async editMessage(options: MessageEditOptions): Promise<void> {
@@ -649,11 +667,20 @@ function nowPlayingEmbed(track: IYandexTrack): EmbedBuilder {
   return embed
 }
 
-function controlsRow(paused: boolean): ActionRowBuilder<ButtonBuilder> {
+interface ControlsState {
+  paused: boolean
+  hasTrack: boolean
+  hasPrevious: boolean
+}
+
+/**
+ * Кнопки плеера. Недоступные сейчас действия выключены, чтобы не объяснять их сообщениями
+ */
+function controlsRow({ paused, hasTrack, hasPrevious }: ControlsState): ActionRowBuilder<ButtonBuilder> {
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
-    controlButton('like', '👍'),
-    controlButton('previous', '⏮️'),
-    paused ? controlButton('resume', '▶️') : controlButton('pause', '⏸️'),
+    controlButton('like', '👍').setDisabled(!hasTrack),
+    controlButton('previous', '⏮️').setDisabled(!hasPrevious),
+    paused ? controlButton('resume', '▶️') : controlButton('pause', '⏸️').setDisabled(!hasTrack),
     controlButton('stop', '⏹️'),
     controlButton('next', '⏭️')
   )

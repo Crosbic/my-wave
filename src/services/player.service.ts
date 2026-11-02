@@ -1,19 +1,12 @@
 import { setTimeout as sleep } from 'timers/promises'
 
-import {
-  ButtonInteraction,
-  GuildTextBasedChannel,
-  MessageFlags,
-  PermissionFlagsBits,
-  User,
-  VoiceBasedChannel
-} from 'discord.js'
+import { ButtonInteraction, GuildTextBasedChannel, PermissionFlagsBits, User, VoiceBasedChannel } from 'discord.js'
 
 import { DatabaseService } from './database.service.js'
 import { stoppedEmbed, WAVE_BUTTON_PREFIX, WaveAction, WaveSession } from './wave-session.js'
 import { YandexAuthError, YandexMusicService } from './yandex-music.service.js'
 import { describeError, UserFacingError } from '../utils/errors.js'
-import { respond } from '../utils/interactions.js'
+import { LONG_NOTICE_TTL, notify, SHORT_NOTICE_TTL } from '../utils/interactions.js'
 import { isBotAdmin } from '../utils/permissions.js'
 
 const STATION_ID = 'user:onyourwave'
@@ -122,12 +115,16 @@ export class PlayerService {
     }
 
     try {
-      await interaction.deferReply({ flags: MessageFlags.Ephemeral })
+      // Результат большинства кнопок виден в самом плеере, поэтому нажатие подтверждаем без сообщения
+      await interaction.deferUpdate()
       const denied = this.checkAccess(session, interaction, action)
-      await respond(interaction, denied ?? (await this.runAction(session, interaction, action)))
+      const notice = denied ? warning(denied) : await this.runAction(session, interaction, action)
+      if (notice) {
+        await notify(interaction, notice.content, notice.ttl)
+      }
     } catch (error) {
       console.error(`Ошибка при обработке кнопки ${customId}:`, describeError(error))
-      await respond(interaction, 'Произошла ошибка при управлении плеером.')
+      await notify(interaction, 'Произошла ошибка при управлении плеером.', LONG_NOTICE_TTL)
     }
   }
 
@@ -169,42 +166,49 @@ export class PlayerService {
     return null
   }
 
-  private async runAction(session: WaveSession, interaction: ButtonInteraction, action: WaveAction): Promise<string> {
+  /**
+   * Выполняет действие кнопки. Уведомление возвращается, только если результат не виден в самом плеере
+   */
+  private async runAction(
+    session: WaveSession,
+    interaction: ButtonInteraction,
+    action: WaveAction
+  ): Promise<Notice | null> {
     switch (action) {
       case 'like':
         return this.likeCurrentTrack(session, interaction.user)
-      case 'previous': {
-        const result = await session.previous()
-        if (result === 'empty') {
-          return 'Нет предыдущих треков для воспроизведения.'
-        }
-        return result === 'ok' ? 'Воспроизведение предыдущего трека.' : 'Не удалось воспроизвести предыдущий трек.'
-      }
+      case 'previous':
+        // Пустую историю показывает неактивная кнопка ⏮️, поэтому сообщаем только о сбое
+        return (await session.previous()) === 'failed' ? warning('Не удалось воспроизвести предыдущий трек.') : null
       case 'pause':
-        return session.pause() ? 'Воспроизведение приостановлено.' : 'Сейчас нечего ставить на паузу.'
+        session.pause()
+        return null
       case 'resume':
-        return session.resume() ? 'Воспроизведение возобновлено.' : 'Плеер не стоит на паузе.'
+        session.resume()
+        return null
       case 'stop':
         await session.destroy('Плеер был остановлен.')
-        return 'Воспроизведение остановлено.'
+        return null
       case 'next':
         await session.skip()
-        return 'Переход к следующему треку.'
+        return null
     }
   }
 
   /**
-   * Лайк текущего трека в аккаунт пользователя, нажавшего кнопку
+   * Лайк текущего трека в аккаунт пользователя, нажавшего кнопку.
+   * Результат не виден в плеере и у каждого свой, поэтому о нём сообщаем
    */
-  private async likeCurrentTrack(session: WaveSession, user: User): Promise<string> {
+  private async likeCurrentTrack(session: WaveSession, user: User): Promise<Notice | null> {
+    // Пока трек загружается, кнопка 👍 неактивна
     const track = session.currentTrack
     if (!track) {
-      return 'Нет текущего трека для лайка.'
+      return null
     }
 
     const userData = DatabaseService.getInstance().getUserData(user.id)
     if (!userData) {
-      return 'Вы не авторизованы в Яндекс Музыке. Используйте команду `/login` для авторизации.'
+      return warning('Вы не авторизованы в Яндекс Музыке. Используйте команду `/login` для авторизации.')
     }
 
     try {
@@ -214,15 +218,31 @@ export class PlayerService {
         YandexMusicService.fullTrackId(track)
       )
       return liked
-        ? `Трек «${track.title}» добавлен в «Мне нравится» у ${userData.userInfo.nickName}!`
-        : `Не удалось добавить трек «${track.title}» в «Мне нравится».`
+        ? confirmation(`Трек «${track.title}» добавлен в «Мне нравится».`)
+        : warning(`Не удалось добавить трек «${track.title}» в «Мне нравится».`)
     } catch (error) {
       if (error instanceof YandexAuthError) {
-        return 'Ваш токен Яндекса недействителен или истёк. Получите новый через `/login-help` и выполните `/login`.'
+        return warning(
+          'Ваш токен Яндекса недействителен или истёк. Получите новый через `/login-help` и выполните `/login`.'
+        )
       }
       throw error
     }
   }
+}
+
+interface Notice {
+  content: string
+  ttl: number
+}
+
+// Подтверждение исчезает быстро, а отказ или ошибку нужно успеть прочитать
+function confirmation(content: string): Notice {
+  return { content, ttl: SHORT_NOTICE_TTL }
+}
+
+function warning(content: string): Notice {
+  return { content, ttl: LONG_NOTICE_TTL }
 }
 
 function isWaveAction(action: string): action is WaveAction {
