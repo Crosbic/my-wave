@@ -1,4 +1,4 @@
-FROM node:24-bookworm AS builder
+FROM node:26-bookworm AS builder
 
 WORKDIR /build
 
@@ -9,7 +9,7 @@ COPY tsconfig.json ./
 COPY src ./src
 RUN yarn build
 
-FROM node:24-bookworm
+FROM node:26-bookworm
 
 ENV NODE_ENV=production
 
