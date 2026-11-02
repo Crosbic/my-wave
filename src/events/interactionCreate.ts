@@ -1,31 +1,35 @@
 import { Events, Interaction } from 'discord.js'
 
+import { commandsByName } from '../commands/index.js'
 import { PlayerService } from '../services/player.service.js'
-import { describeError } from '../utils/errors.js'
+import { BotEvent } from '../types/event.js'
 import { respond } from '../utils/interactions.js'
+import { logger } from '../utils/logger.js'
 
-export const name = Events.InteractionCreate
-export const once = false
+export const interactionCreate = {
+  name: Events.InteractionCreate,
+  async execute(interaction: Interaction) {
+    if (interaction.isButton()) {
+      await PlayerService.getInstance().handleButton(interaction)
+      return
+    }
 
-export async function execute(interaction: Interaction) {
-  if (interaction.isButton()) {
-    await PlayerService.getInstance().handleButton(interaction)
-    return
+    if (!interaction.isChatInputCommand()) return
+
+    const command = commandsByName.get(interaction.commandName)
+
+    if (!command) {
+      logger.error(`Команда ${interaction.commandName} не найдена`)
+      return
+    }
+
+    logger.debug(`/${interaction.commandName} от ${interaction.user.tag}`)
+
+    try {
+      await command.execute(interaction)
+    } catch (error) {
+      logger.error(`Ошибка при выполнении команды /${interaction.commandName}`, error)
+      await respond(interaction, 'Произошла ошибка при выполнении команды!')
+    }
   }
-
-  if (!interaction.isChatInputCommand()) return
-
-  const command = interaction.client.commands.get(interaction.commandName)
-
-  if (!command) {
-    console.error(`Команда ${interaction.commandName} не найдена.`)
-    return
-  }
-
-  try {
-    await command.execute(interaction)
-  } catch (error) {
-    console.error(`Ошибка при выполнении команды /${interaction.commandName}:`, describeError(error))
-    await respond(interaction, 'Произошла ошибка при выполнении команды!')
-  }
-}
+} satisfies BotEvent<Events.InteractionCreate>

@@ -5,7 +5,9 @@ import axios, { isAxiosError } from 'axios'
 import { YandexAuthError } from '../errors/yandexAuthError.js'
 import { IUserData } from '../types/userData.js'
 import { IStationBatch, IYandexTrack } from '../types/yandexTrack.js'
-import { describeError } from '../utils/errors.js'
+import { logger } from '../utils/logger.js'
+
+import type { components, operations } from '../types/yandex-api.js'
 
 const API_URL = 'https://api.music.yandex.net'
 const REQUEST_TIMEOUT = 15_000
@@ -14,29 +16,29 @@ const REQUEST_TIMEOUT = 15_000
 const SIGN_SALT = 'XGRlBW9FXlekgbPrRHuSiA'
 const FEEDBACK_FROM = 'ym-player-bot'
 
-/**
- * Фидбэк станции. batchId передаётся как batch-id и должен отсутствовать для radioStarted
- */
-export type StationFeedback =
-  | { type: 'radioStarted' }
-  | { type: 'trackStarted'; trackId: string; batchId: string | null }
-  | { type: 'trackFinished' | 'skip'; trackId: string; batchId: string | null; totalPlayedSeconds: number }
+const log = logger.child('yandex')
 
-interface IApiTrack {
-  id: string | number
-  title: string
-  available?: boolean
-  artists?: Array<{ name: string }>
-  albums?: Array<{ id?: number; title?: string }>
-  coverUri?: string
-  durationMs?: number
-}
+// Типы запросов и ответов сгенерированы из спецификации API (yarn api:generate):
+// опечатка в имени параметра или поля запроса не скомпилируется
+type ApiTrack = components['schemas']['Track']
+type DownloadVariant = components['schemas']['TrackDownloadInfo']
+type AccountStatusResponse = operations['getAccountStatus']['responses'][200]['content']['application/json']
+type StationTracksQuery = NonNullable<operations['getStationTracks']['parameters']['query']>
+type StationTracksResponse = operations['getStationTracks']['responses'][200]['content']['application/json']
+type FeedbackQuery = NonNullable<operations['sendStationFeedback']['parameters']['query']>
+type FeedbackBody = operations['sendStationFeedback']['requestBody']['content']['application/json']
+type DownloadInfoResponse = operations['getDownloadInfo']['responses'][200]['content']['application/json']
+type LikeTracksForm = operations['likeTracks']['requestBody']['content']['application/x-www-form-urlencoded']
 
-interface IDownloadInfo {
-  codec: string
-  bitrateInKbps: number
-  preview?: boolean | string
-  downloadInfoUrl: string
+// Ответы, которых нет в спецификации
+interface ILoginInfo {
+  id: string
+  login?: string
+  display_name?: string
+  real_name?: string
+  first_name?: string
+  last_name?: string
+  default_avatar_id?: string
 }
 
 interface IDirectLinkInfo {
@@ -45,6 +47,14 @@ interface IDirectLinkInfo {
   ts?: string
   s?: string
 }
+
+/**
+ * Фидбэк станции. batchId передаётся как batch-id и должен отсутствовать для radioStarted
+ */
+export type StationFeedback =
+  | { type: 'radioStarted' }
+  | { type: 'trackStarted'; trackId: string; batchId: string | null }
+  | { type: 'trackFinished' | 'skip'; trackId: string; batchId: string | null; totalPlayedSeconds: number }
 
 export class YandexMusicService {
   private static instance: YandexMusicService
@@ -73,8 +83,8 @@ export class YandexMusicService {
   public async getUserInfo(token: string): Promise<{ userInfo: IUserData; hasPlus: boolean }> {
     try {
       const [statusResponse, userResponse] = await Promise.all([
-        this.http.get('/account/status', { headers: this.authHeaders(token) }),
-        axios.get('https://login.yandex.ru/info', {
+        this.http.get<AccountStatusResponse>('/account/status', { headers: this.authHeaders(token) }),
+        axios.get<ILoginInfo>('https://login.yandex.ru/info', {
           params: { format: 'json' },
           headers: this.authHeaders(token),
           timeout: REQUEST_TIMEOUT
@@ -82,7 +92,7 @@ export class YandexMusicService {
       ])
 
       const user = userResponse.data
-      const hasPlus = !!statusResponse.data?.result?.plus?.hasPlus
+      const hasPlus = !!statusResponse.data.result?.plus?.hasPlus
 
       return {
         userInfo: {
@@ -106,20 +116,21 @@ export class YandexMusicService {
    * queue — идентификатор трека, который только что играл: по нему станция продолжает волну, а не начинает заново
    */
   public async getStationTracks(token: string, stationId: string, queue?: string): Promise<IStationBatch> {
+    const params: StationTracksQuery = { settings2: true, queue }
+
     try {
-      const response = await this.http.get(`/rotor/station/${stationId}/tracks`, {
+      const response = await this.http.get<StationTracksResponse>(`/rotor/station/${stationId}/tracks`, {
         headers: this.authHeaders(token),
-        params: { settings2: true, queue }
+        params
       })
 
-      const result = response.data?.result
-      const sequence: Array<{ track?: IApiTrack }> = result?.sequence ?? []
-      const tracks = sequence
+      const { batchId, sequence } = response.data.result
+      const tracks = (sequence ?? [])
         .map(item => item.track)
-        .filter((track): track is IApiTrack => !!track && track.available !== false)
+        .filter(track => track && track.available)
         .map(track => this.toTrack(track))
 
-      return { batchId: result?.batchId ?? null, tracks }
+      return { batchId: batchId ?? null, tracks }
     } catch (error) {
       throw this.wrapError(error)
     }
@@ -129,12 +140,12 @@ export class YandexMusicService {
    * Отправка фидбэка станции. Ошибки только логируются: фидбэк не должен мешать воспроизведению
    */
   public async sendStationFeedback(token: string, stationId: string, feedback: StationFeedback): Promise<boolean> {
-    const body: Record<string, string | number> = {
+    const body: FeedbackBody = {
       type: feedback.type,
       timestamp: new Date().toISOString().replace('Z', ''),
       from: FEEDBACK_FROM
     }
-    let params: Record<string, string> | undefined
+    let params: FeedbackQuery | undefined
 
     if (feedback.type !== 'radioStarted') {
       body.trackId = feedback.trackId
@@ -150,7 +161,7 @@ export class YandexMusicService {
       await this.http.post(`/rotor/station/${stationId}/feedback`, body, { headers: this.authHeaders(token), params })
       return true
     } catch (error) {
-      console.warn(`Не удалось отправить фидбэк ${feedback.type} станции ${stationId}:`, describeError(error))
+      log.warn(`Не удалось отправить фидбэк ${feedback.type} станции ${stationId}`, error)
       return false
     }
   }
@@ -161,10 +172,12 @@ export class YandexMusicService {
    */
   public async getStreamUrl(token: string, trackId: string): Promise<string | null> {
     try {
-      const infoResponse = await this.http.get(`/tracks/${trackId}/download-info`, { headers: this.authHeaders(token) })
-      const variant = this.pickDownloadVariant(infoResponse.data?.result ?? [])
+      const infoResponse = await this.http.get<DownloadInfoResponse>(`/tracks/${trackId}/download-info`, {
+        headers: this.authHeaders(token)
+      })
+      const variant = this.pickDownloadVariant(infoResponse.data.result ?? [])
       if (!variant) {
-        console.warn(`Для трека ${trackId} нет доступных вариантов загрузки`)
+        log.warn(`Для трека ${trackId} нет доступных вариантов загрузки`)
         return null
       }
 
@@ -174,7 +187,7 @@ export class YandexMusicService {
       })
       const { host, path, ts, s } = linkResponse.data ?? {}
       if (!host || !path || !ts || !s) {
-        console.warn(`Не удалось получить данные для загрузки трека ${trackId}`)
+        log.warn(`Не удалось получить данные для загрузки трека ${trackId}`)
         return null
       }
 
@@ -189,7 +202,7 @@ export class YandexMusicService {
       if (wrapped instanceof YandexAuthError) {
         throw wrapped
       }
-      console.error(`Не удалось получить ссылку на трек ${trackId}:`, describeError(error))
+      log.error(`Не удалось получить ссылку на трек ${trackId}`, error)
       return null
     }
   }
@@ -198,19 +211,19 @@ export class YandexMusicService {
    * Добавление трека в «Мне нравится»
    */
   public async likeTrack(token: string, userId: string, trackId: string): Promise<boolean> {
+    const form: LikeTracksForm = { 'track-ids': [trackId] }
+
     try {
-      await this.http.post(
-        `/users/${userId}/likes/tracks/add-multiple`,
-        new URLSearchParams({ 'track-ids': trackId }),
-        { headers: this.authHeaders(token) }
-      )
+      await this.http.post(`/users/${userId}/likes/tracks/add-multiple`, toFormBody(form), {
+        headers: this.authHeaders(token)
+      })
       return true
     } catch (error) {
       const wrapped = this.wrapError(error)
       if (wrapped instanceof YandexAuthError) {
         throw wrapped
       }
-      console.error(`Не удалось добавить трек ${trackId} в «Мне нравится»:`, describeError(error))
+      log.error(`Не удалось добавить трек ${trackId} в «Мне нравится»`, error)
       return false
     }
   }
@@ -218,8 +231,12 @@ export class YandexMusicService {
   /**
    * Лучший вариант загрузки: полная версия, mp3, максимальный битрейт
    */
-  private pickDownloadVariant(variants: IDownloadInfo[]): IDownloadInfo | undefined {
-    const isPreview = (variant: IDownloadInfo) => variant.preview === true || variant.preview === 'true'
+  private pickDownloadVariant(variants: DownloadVariant[]): DownloadVariant | undefined {
+    const isPreview = (variant: DownloadVariant) => {
+      // В спецификации preview описан строкой, но API отдаёт boolean
+      const preview: unknown = variant.preview
+      return preview === true || preview === 'true'
+    }
 
     return [...variants].sort(
       (a, b) =>
@@ -229,7 +246,7 @@ export class YandexMusicService {
     )[0]
   }
 
-  private toTrack(track: IApiTrack): IYandexTrack {
+  private toTrack(track: ApiTrack): IYandexTrack {
     return {
       id: String(track.id),
       title: track.title,
@@ -250,4 +267,13 @@ export class YandexMusicService {
     }
     return error
   }
+}
+
+/**
+ * Тело application/x-www-form-urlencoded: поле-массив передаётся повторяющимися ключами
+ */
+function toFormBody(fields: Record<string, string[] | undefined>): URLSearchParams {
+  return new URLSearchParams(
+    Object.entries(fields).flatMap(([key, values]) => (values ?? []).map(value => [key, value]))
+  )
 }

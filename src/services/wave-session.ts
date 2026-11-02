@@ -34,25 +34,45 @@ import {
 import { StationFeedback, YandexMusicService } from './yandex-music.service.js'
 import { YandexAuthError } from '../errors/yandexAuthError.js'
 import { IYandexTrack } from '../types/yandexTrack.js'
-import { describeError, UserFacingError } from '../utils/errors.js'
+import { UserFacingError } from '../utils/errors.js'
+import { Logger, logger } from '../utils/logger.js'
 
 const VOLUME = 0.8 // Чтоб не оглохли
-const CONNECT_TIMEOUT = 20_000
-const RECONNECT_TIMEOUT = 5_000
-const ACTIVITY_CHECK_INTERVAL = 5_000
-const EMPTY_CHANNEL_TIMEOUT = 20_000
-const NO_PLAYBACK_TIMEOUT = 30_000
-const PAUSE_TIMEOUT = 10 * 60_000
 const HISTORY_SIZE = 10
-// Если поток оборвался в первые RETRY_WINDOW мс, трек пробуем запустить заново, всего не больше MAX_TRACK_ATTEMPTS раз
+// Сколько раз запускаем трек, если поток оборвался в первые retryWindow мс
 const MAX_TRACK_ATTEMPTS = 3
-const RETRY_WINDOW = 10_000
-const RETRY_DELAY = 2_000
-// Через сколько после старта проверяем, что звук действительно пошёл: битый поток тоже ненадолго переходит в Playing
-const START_CONFIRM_DELAY = 1_000
 // Сколько треков подряд может не воспроизвестись, прежде чем плеер остановится
 const MAX_FAILED_TRACKS = 5
 const BATCH_ATTEMPTS = 3
+
+/**
+ * Задержки и таймауты сессии в миллисекундах
+ */
+export interface WaveTimings {
+  connectTimeout: number
+  reconnectTimeout: number
+  activityCheckInterval: number
+  emptyChannelTimeout: number
+  noPlaybackTimeout: number
+  pauseTimeout: number
+  // Если поток оборвался раньше этого времени, трек запускается заново
+  retryWindow: number
+  retryDelay: number
+  // Через сколько после старта проверяем, что звук действительно пошёл: битый поток тоже ненадолго переходит в Playing
+  startConfirmDelay: number
+}
+
+export const DEFAULT_TIMINGS: WaveTimings = {
+  connectTimeout: 20_000,
+  reconnectTimeout: 5_000,
+  activityCheckInterval: 5_000,
+  emptyChannelTimeout: 20_000,
+  noPlaybackTimeout: 30_000,
+  pauseTimeout: 10 * 60_000,
+  retryWindow: 10_000,
+  retryDelay: 2_000,
+  startConfirmDelay: 1_000
+}
 
 const COLOR_PLAYING = '#FFCC00'
 const COLOR_STOPPED = '#FF0000'
@@ -88,6 +108,7 @@ export interface WaveSessionOptions {
   owner: WaveOwner
   stationId: string
   onDestroy: (session: WaveSession) => void
+  timings?: Partial<WaveTimings>
 }
 
 /**
@@ -104,6 +125,8 @@ export class WaveSession {
   private readonly player: AudioPlayer
   private readonly onDestroy: (session: WaveSession) => void
   private readonly yandex = YandexMusicService.getInstance()
+  private readonly timings: WaveTimings
+  private readonly log: Logger
   private readonly activityTimer: NodeJS.Timeout
 
   private message: Message | null
@@ -128,12 +151,18 @@ export class WaveSession {
   private pausedSince: number | null = null
   private idleSince: number | null = null
 
-  private constructor(options: WaveSessionOptions, connection: VoiceConnection, message: Message) {
+  /**
+   * Сессия поверх уже подключённого голосового соединения и отправленного сообщения.
+   * В боте используйте WaveSession.create: он подключается к каналу и отправляет сообщение сам
+   */
+  constructor(options: WaveSessionOptions, connection: VoiceConnection, message: Message) {
     this.guild = options.voiceChannel.guild
     this.guildId = this.guild.id
     this.owner = options.owner
     this.stationId = options.stationId
     this.onDestroy = options.onDestroy
+    this.timings = { ...DEFAULT_TIMINGS, ...options.timings }
+    this.log = logger.child(`guild ${this.guildId}`)
     this.connection = connection
     this.message = message
 
@@ -147,14 +176,14 @@ export class WaveSession {
 
     connection.on('stateChange', (oldState, newState) => {
       if (oldState.status !== newState.status) {
-        console.log(`[${this.guildId}] Соединение: ${oldState.status} -> ${newState.status}`)
+        this.log.debug(`Соединение: ${oldState.status} -> ${newState.status}`)
       }
     })
     connection.on(VoiceConnectionStatus.Disconnected, () => void this.onDisconnected())
     connection.on(VoiceConnectionStatus.Destroyed, () => void this.destroy('Бот отключён от голосового канала.'))
-    connection.on('error', error => console.error(`[${this.guildId}] Ошибка соединения:`, describeError(error)))
+    connection.on('error', error => this.log.error('Ошибка соединения', error))
 
-    this.activityTimer = setInterval(() => this.checkActivity(), ACTIVITY_CHECK_INTERVAL)
+    this.activityTimer = setInterval(() => this.checkActivity(), this.timings.activityCheckInterval)
   }
 
   /**
@@ -163,6 +192,8 @@ export class WaveSession {
   static async create(options: WaveSessionOptions): Promise<WaveSession> {
     const { voiceChannel, textChannel } = options
     const guildId = voiceChannel.guild.id
+    const log = logger.child(`guild ${guildId}`)
+    const { connectTimeout } = { ...DEFAULT_TIMINGS, ...options.timings }
 
     const connection = joinVoiceChannel({
       channelId: voiceChannel.id,
@@ -171,9 +202,9 @@ export class WaveSession {
     })
 
     try {
-      await entersState(connection, VoiceConnectionStatus.Ready, CONNECT_TIMEOUT)
+      await entersState(connection, VoiceConnectionStatus.Ready, connectTimeout)
     } catch (error) {
-      console.error(`[${guildId}] Не удалось подключиться к голосовому каналу:`, describeError(error))
+      log.error('Не удалось подключиться к голосовому каналу', error)
       destroyConnection(connection)
       throw new UserFacingError('Не удалось подключиться к голосовому каналу. Попробуйте ещё раз.')
     }
@@ -185,7 +216,7 @@ export class WaveSession {
         components: [controlsRow({ paused: false, hasTrack: false, hasPrevious: false })]
       })
     } catch (error) {
-      console.error(`[${guildId}] Не удалось отправить сообщение плеера:`, describeError(error))
+      log.error('Не удалось отправить сообщение плеера', error)
       destroyConnection(connection)
       throw new UserFacingError('Не удалось отправить сообщение с плеером в этот канал. Проверьте права бота.')
     }
@@ -279,7 +310,7 @@ export class WaveSession {
 
     this.destroyed = true
     this.endReason = reason
-    console.log(`[${this.guildId}] Плеер остановлен: ${reason}`)
+    this.log.info(`Плеер остановлен: ${reason}`)
 
     clearInterval(this.activityTimer)
     this.player.stop(true)
@@ -308,7 +339,7 @@ export class WaveSession {
             'Токен Яндекса владельца плеера недействителен или истёк. Обновите его: `/login-help`, затем `/login`.'
           )
         } else {
-          console.error(`[${this.guildId}] Ошибка плеера:`, describeError(error))
+          this.log.error('Ошибка плеера', error)
           void this.destroy('Произошла ошибка плеера.')
         }
       } finally {
@@ -371,7 +402,7 @@ export class WaveSession {
     this.current = { item, resource, attempt }
     this.failedResource = null
     this.player.play(resource)
-    console.log(`[${this.guildId}] Воспроизведение: ${formatTrack(item.track)}`)
+    this.log.info(`Воспроизведение: ${formatTrack(item.track)}`)
     this.render()
 
     return true
@@ -413,14 +444,11 @@ export class WaveSession {
         if (error instanceof YandexAuthError) {
           throw error
         }
-        console.error(
-          `[${this.guildId}] Не удалось загрузить треки станции (попытка ${attempt}/${BATCH_ATTEMPTS}):`,
-          describeError(error)
-        )
+        this.log.error(`Не удалось загрузить треки станции (попытка ${attempt}/${BATCH_ATTEMPTS})`, error)
       }
 
       if (attempt < BATCH_ATTEMPTS) {
-        await sleep(attempt * RETRY_DELAY)
+        await sleep(attempt * this.timings.retryDelay)
       }
     }
   }
@@ -444,7 +472,7 @@ export class WaveSession {
           if (!this.destroyed && this.current === playback) {
             this.confirmStarted(playback)
           }
-        }, START_CONFIRM_DELAY)
+        }, this.timings.startConfirmDelay)
       }
       return
     }
@@ -458,7 +486,7 @@ export class WaveSession {
   private onPlayerError(error: AudioPlayerError): void {
     // Сразу после ошибки плеер перейдёт в Idle, там и решаем, повторять ли трек
     this.failedResource = error.resource
-    console.error(`[${this.guildId}] Ошибка воспроизведения:`, describeError(error))
+    this.log.error('Ошибка воспроизведения', error)
   }
 
   /**
@@ -483,18 +511,18 @@ export class WaveSession {
       return
     }
 
-    const endedTooEarly =
-      resource.playbackDuration < RETRY_WINDOW && (playback.item.track.durationMs ?? 0) > RETRY_WINDOW
+    const { retryWindow } = this.timings
+    const endedTooEarly = resource.playbackDuration < retryWindow && (playback.item.track.durationMs ?? 0) > retryWindow
     if (this.failedResource !== resource && !endedTooEarly) {
       await this.advance('finished')
       return
     }
 
-    if (resource.playbackDuration < RETRY_WINDOW && playback.attempt < MAX_TRACK_ATTEMPTS) {
-      console.log(
-        `[${this.guildId}] Поток прервался, повторная попытка ${playback.attempt + 1}/${MAX_TRACK_ATTEMPTS}: ${formatTrack(playback.item.track)}`
+    if (resource.playbackDuration < retryWindow && playback.attempt < MAX_TRACK_ATTEMPTS) {
+      this.log.warn(
+        `Поток прервался, повторная попытка ${playback.attempt + 1}/${MAX_TRACK_ATTEMPTS}: ${formatTrack(playback.item.track)}`
       )
-      await sleep(RETRY_DELAY)
+      await sleep(this.timings.retryDelay)
       if (this.destroyed || (await this.play(playback.item, playback.attempt + 1))) {
         return
       }
@@ -534,10 +562,10 @@ export class WaveSession {
     try {
       // Переподключение (например, бота перенесли в другой канал) начнётся само, если это не окончательное отключение
       await Promise.race([
-        entersState(this.connection, VoiceConnectionStatus.Signalling, RECONNECT_TIMEOUT),
-        entersState(this.connection, VoiceConnectionStatus.Connecting, RECONNECT_TIMEOUT)
+        entersState(this.connection, VoiceConnectionStatus.Signalling, this.timings.reconnectTimeout),
+        entersState(this.connection, VoiceConnectionStatus.Connecting, this.timings.reconnectTimeout)
       ])
-      console.log(`[${this.guildId}] Соединение восстанавливается...`)
+      this.log.info('Соединение восстанавливается...')
     } catch {
       void this.destroy('Соединение с голосовым каналом потеряно.')
     }
@@ -549,22 +577,23 @@ export class WaveSession {
     }
 
     const now = Date.now()
+    const { emptyChannelTimeout, pauseTimeout, noPlaybackTimeout } = this.timings
 
     this.emptySince = this.countListeners() === 0 ? (this.emptySince ?? now) : null
-    if (this.emptySince !== null && now - this.emptySince >= EMPTY_CHANNEL_TIMEOUT) {
+    if (this.emptySince !== null && now - this.emptySince >= emptyChannelTimeout) {
       void this.destroy('Все пользователи покинули голосовой канал.')
       return
     }
 
     const status = this.player.state.status
     this.pausedSince = status === AudioPlayerStatus.Paused ? (this.pausedSince ?? now) : null
-    if (this.pausedSince !== null && now - this.pausedSince >= PAUSE_TIMEOUT) {
-      void this.destroy(`Пауза длилась дольше ${PAUSE_TIMEOUT / 60_000} минут.`)
+    if (this.pausedSince !== null && now - this.pausedSince >= pauseTimeout) {
+      void this.destroy(`Пауза длилась дольше ${Math.round(pauseTimeout / 60_000)} минут.`)
       return
     }
 
     this.idleSince = status === AudioPlayerStatus.Idle && !this.busy ? (this.idleSince ?? now) : null
-    if (this.idleSince !== null && now - this.idleSince >= NO_PLAYBACK_TIMEOUT) {
+    if (this.idleSince !== null && now - this.idleSince >= noPlaybackTimeout) {
       void this.destroy('Нет активного воспроизведения музыки.')
     }
   }
@@ -625,7 +654,7 @@ export class WaveSession {
         this.message = null
         return
       }
-      console.error(`[${this.guildId}] Не удалось обновить сообщение плеера:`, describeError(error))
+      this.log.error('Не удалось обновить сообщение плеера', error)
     }
   }
 }

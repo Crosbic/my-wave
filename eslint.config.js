@@ -6,9 +6,9 @@ import prettierRecommended from 'eslint-plugin-prettier/recommended'
 import unusedImports from 'eslint-plugin-unused-imports'
 
 export default defineConfig([
-  globalIgnores(['dist/', 'node_modules/']),
+  globalIgnores(['dist/', 'node_modules/', 'src/types/yandex-api.d.ts']),
   {
-    files: ['src/**/*.ts'],
+    files: ['src/**/*.ts', 'test/**/*.ts'],
     extends: [
       js.configs.recommended,
       tsPlugin.configs['flat/recommended'],
@@ -41,6 +41,7 @@ export default defineConfig([
       '@typescript-eslint/no-non-null-assertion': 'off',
       '@typescript-eslint/no-explicit-any': 'off',
       'import/no-named-as-default': 'off',
+      'import/no-named-as-default-member': 'off',
 
       // Удаление неиспользуемых импортов
       '@typescript-eslint/no-unused-vars': 'off', // Отключаем стандартное правило

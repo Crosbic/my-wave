@@ -6,8 +6,9 @@ import { DatabaseService } from './database.service.js'
 import { stoppedEmbed, WAVE_BUTTON_PREFIX, WaveAction, WaveSession } from './wave-session.js'
 import { YandexMusicService } from './yandex-music.service.js'
 import { YandexAuthError } from '../errors/yandexAuthError.js'
-import { describeError, UserFacingError } from '../utils/errors.js'
+import { UserFacingError } from '../utils/errors.js'
 import { LONG_NOTICE_TTL, notify, SHORT_NOTICE_TTL } from '../utils/interactions.js'
+import { logger } from '../utils/logger.js'
 import { isBotAdmin } from '../utils/permissions.js'
 
 const STATION_ID = 'user:onyourwave'
@@ -124,7 +125,7 @@ export class PlayerService {
         await notify(interaction, notice.content, notice.ttl)
       }
     } catch (error) {
-      console.error(`Ошибка при обработке кнопки ${customId}:`, describeError(error))
+      logger.error(`Ошибка при обработке кнопки ${customId}`, error)
       await notify(interaction, 'Произошла ошибка при управлении плеером.', LONG_NOTICE_TTL)
     }
   }
@@ -136,7 +137,7 @@ export class PlayerService {
     try {
       await interaction.update({ embeds: [stoppedEmbed('Этот плеер больше не активен.')], components: [] })
     } catch (error) {
-      console.error('Не удалось обновить сообщение неактивного плеера:', describeError(error))
+      logger.error('Не удалось обновить сообщение неактивного плеера', error)
     }
   }
 

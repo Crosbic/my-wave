@@ -3,8 +3,8 @@ import { ChatInputCommandInteraction, MessageFlags, SlashCommandBuilder } from '
 import { YandexAuthError } from '../errors/yandexAuthError.js'
 import { DatabaseService } from '../services/database.service.js'
 import { YandexMusicService } from '../services/yandex-music.service.js'
-import { describeError } from '../utils/errors.js'
 import { LONG_NOTICE_TTL, respond } from '../utils/interactions.js'
+import { logger } from '../utils/logger.js'
 
 export const data = new SlashCommandBuilder()
   .setName('login')
@@ -26,7 +26,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
       await respond(interaction, 'Токен недействителен или истёк. Получите новый токен по инструкции из `/login-help`.')
       return
     }
-    console.error('Ошибка при авторизации:', describeError(error))
+    logger.error('Ошибка при авторизации', error)
     await respond(
       interaction,
       'Не удалось получить информацию о пользователе от Яндекса. Пожалуйста, попробуйте позже.'

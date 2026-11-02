@@ -1,8 +1,14 @@
 import { Client, Events } from 'discord.js'
 
-export const name = Events.ClientReady
-export const once = true
+import { syncCommands } from '../commands/sync.js'
+import { BotEvent } from '../types/event.js'
+import { logger } from '../utils/logger.js'
 
-export function execute(client: Client) {
-  console.log(`Бот успешно запущен как ${client.user?.tag}`)
-}
+export const ready = {
+  name: Events.ClientReady,
+  once: true,
+  async execute(client: Client<true>) {
+    logger.info(`Бот запущен как ${client.user.tag}`)
+    await syncCommands(client)
+  }
+} satisfies BotEvent<Events.ClientReady>

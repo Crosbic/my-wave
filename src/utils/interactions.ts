@@ -1,6 +1,6 @@
 import { ButtonInteraction, MessageFlags, RepliableInteraction } from 'discord.js'
 
-import { describeError } from './errors.js'
+import { logger } from './logger.js'
 
 // Через сколько исчезают временные уведомления: короткие подтверждения и сообщения, которые нужно успеть прочитать
 export const SHORT_NOTICE_TTL = 5_000
@@ -26,7 +26,7 @@ export async function respond(interaction: RepliableInteraction, content: string
     }
     if (ttl) deleteLater(interaction, '@original', ttl)
   } catch (error) {
-    console.error('Не удалось ответить на взаимодействие:', describeError(error))
+    logger.error('Не удалось ответить на взаимодействие', error)
   }
 }
 
@@ -38,7 +38,7 @@ export async function notify(interaction: ButtonInteraction, content: string, tt
     const message = await interaction.followUp({ content, flags: MessageFlags.Ephemeral })
     deleteLater(interaction, message.id, ttl)
   } catch (error) {
-    console.error('Не удалось отправить уведомление:', describeError(error))
+    logger.error('Не удалось отправить уведомление', error)
   }
 }
 
@@ -49,14 +49,14 @@ export async function dismiss(interaction: RepliableInteraction): Promise<void> 
   try {
     await interaction.deleteReply()
   } catch (error) {
-    console.error('Не удалось удалить ответ на взаимодействие:', describeError(error))
+    logger.error('Не удалось удалить ответ на взаимодействие', error)
   }
 }
 
 function deleteLater(interaction: RepliableInteraction, message: string, ttl: number): void {
   setTimeout(() => {
     interaction.deleteReply(message).catch(error => {
-      console.error('Не удалось удалить уведомление:', describeError(error))
+      logger.error('Не удалось удалить уведомление', error)
     })
   }, ttl)
 }
