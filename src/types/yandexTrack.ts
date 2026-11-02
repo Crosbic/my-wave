@@ -2,10 +2,15 @@ export interface IYandexTrack {
   id: string
   title: string
   artists: Array<{ name: string }>
-  albums: Array<{ title: string }>
+  albums: Array<{ id?: number; title: string }>
   coverUri: string
+  durationMs?: number
 }
 
-export interface IYandexTrackSequenceItem {
-  track: IYandexTrack
+/**
+ * Партия треков, выданная станцией. batchId нужен для фидбэка по этим трекам
+ */
+export interface IStationBatch {
+  batchId: string | null
+  tracks: IYandexTrack[]
 }

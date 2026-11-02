@@ -3,15 +3,17 @@ import 'dotenv/config'
 interface Config {
   token: string
   clientId: string
-  devGuildId?: string
   admins: string[]
 }
 
 const config: Config = {
   token: process.env.DISCORD_TOKEN || '',
   clientId: process.env.CLIENT_ID || '',
-  // devGuildId: process.env.DEV_GUILD_ID
-  admins: process.env.ADMINS ? process.env.ADMINS.split(',').map(id => id.trim()) : ['crosbic']
+  admins: process.env.ADMINS
+    ? process.env.ADMINS.split(',')
+        .map(id => id.trim())
+        .filter(Boolean)
+    : []
 }
 
 if (!config.token) {

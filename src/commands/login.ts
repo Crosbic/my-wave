@@ -1,7 +1,9 @@
-import { SlashCommandBuilder, ChatInputCommandInteraction } from 'discord.js'
+import { ChatInputCommandInteraction, MessageFlags, SlashCommandBuilder } from 'discord.js'
 
 import { DatabaseService } from '../services/database.service.js'
-import { YandexMusicService } from '../services/yandex-music.service.js'
+import { YandexAuthError, YandexMusicService } from '../services/yandex-music.service.js'
+import { describeError } from '../utils/errors.js'
+import { respond } from '../utils/interactions.js'
 
 export const data = new SlashCommandBuilder()
   .setName('login')
@@ -11,56 +13,43 @@ export const data = new SlashCommandBuilder()
 export async function execute(interaction: ChatInputCommandInteraction) {
   const userId = interaction.user.id
   const db = DatabaseService.getInstance()
-  const yandexMusicService = YandexMusicService.getInstance()
+  const token = interaction.options.getString('token', true).trim()
 
-  if (db.hasUserToken(userId)) {
-    await interaction.reply({
-      content: 'Вы уже авторизованы через Яндекс! Используйте `/logout` чтобы выйти и авторизоваться заново.',
-      ephemeral: true
-    })
-    return
-  }
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral })
 
-  const token = interaction.options.getString('token')
-  if (!token) {
-    await interaction.reply({
-      content: 'Токен не предоставлен. Используйте команду `/token ВАШТОКЕН`.',
-      ephemeral: true
-    })
-    return
-  }
-
-  await interaction.deferReply({ ephemeral: true })
-
+  let userInfoResult
   try {
-    const userInfoResult = await yandexMusicService.getUserInfo(token)
-
-    if (!userInfoResult) {
-      await interaction.editReply({
-        content: 'Не удалось получить информацию о пользователе. Проверьте правильность токена и попробуйте снова.'
-      })
-      return
-    }
-
-    const { userInfo, hasPlus } = userInfoResult
-
-    if (!hasPlus) {
-      await interaction.editReply({
-        content:
-          'Для использования бота требуется активная подписка Яндекс Плюс. Активируйте подписку и попробуйте снова.'
-      })
-      return
-    }
-
-    db.saveUserToken(userId, token, userInfo)
-
-    await interaction.editReply({
-      content: `Авторизация успешно завершена! Вы вошли как ${userInfo.nickName}. Теперь вы можете использовать команды бота.`
-    })
+    userInfoResult = await YandexMusicService.getInstance().getUserInfo(token)
   } catch (error) {
-    console.error('Ошибка при авторизации:', error)
-    await interaction.editReply({
-      content: 'Произошла ошибка при авторизации. Пожалуйста, попробуйте позже или обратитесь к администратору.'
-    })
+    if (error instanceof YandexAuthError) {
+      await respond(interaction, 'Токен недействителен или истёк. Получите новый токен по инструкции из `/login-help`.')
+      return
+    }
+    console.error('Ошибка при авторизации:', describeError(error))
+    await respond(
+      interaction,
+      'Не удалось получить информацию о пользователе от Яндекса. Пожалуйста, попробуйте позже.'
+    )
+    return
   }
+
+  const { userInfo, hasPlus } = userInfoResult
+  if (!hasPlus) {
+    await respond(
+      interaction,
+      'Для использования бота требуется активная подписка Яндекс Плюс. Активируйте подписку и попробуйте снова.'
+    )
+    return
+  }
+
+  // Повторный вход просто обновляет токен: так можно заменить истёкший токен без /logout
+  const wasAuthorized = db.hasUserToken(userId)
+  db.saveUserToken(userId, token, userInfo)
+
+  await respond(
+    interaction,
+    wasAuthorized
+      ? `Токен обновлён! Вы вошли как ${userInfo.nickName}.`
+      : `Авторизация успешно завершена! Вы вошли как ${userInfo.nickName}. Теперь вы можете использовать команды бота.`
+  )
 }

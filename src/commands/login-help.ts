@@ -1,4 +1,4 @@
-import { SlashCommandBuilder, ChatInputCommandInteraction } from 'discord.js'
+import { ChatInputCommandInteraction, MessageFlags, SlashCommandBuilder } from 'discord.js'
 
 import { DatabaseService } from '../services/database.service.js'
 
@@ -7,21 +7,14 @@ export const data = new SlashCommandBuilder()
   .setDescription('Получить инструкции по авторизации через Яндекс')
 
 export async function execute(interaction: ChatInputCommandInteraction) {
-  const userId = interaction.user.id
-  const db = DatabaseService.getInstance()
-
-  if (db.hasUserToken(userId)) {
-    await interaction.reply({
-      content: 'Вы уже авторизованы через Яндекс! Используйте `/logout` чтобы выйти.',
-      ephemeral: true
-    })
-    return
-  }
-
+  const isAuthorized = DatabaseService.getInstance().hasUserToken(interaction.user.id)
   const authUrl = 'https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd418abb4b39c32c41195d'
+  const note = isAuthorized
+    ? 'Вы уже авторизованы. Если токен истёк, получите новый и выполните `/login` ещё раз: он заменит старый.\n'
+    : ''
 
   await interaction.reply({
-    content: `
+    content: `${note}
 Для авторизации через Яндекс выполните следующие шаги:
 
 1. Перейдите по ссылке: ${authUrl}
@@ -33,6 +26,6 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
 Примечание: Токен действителен в течение года.
 `,
-    ephemeral: true
+    flags: MessageFlags.Ephemeral
   })
 }

@@ -1,4 +1,4 @@
-import { ChatInputCommandInteraction, EmbedBuilder, SlashCommandBuilder } from 'discord.js'
+import { ChatInputCommandInteraction, EmbedBuilder, MessageFlags, SlashCommandBuilder } from 'discord.js'
 
 import { DatabaseService } from '../services/database.service.js'
 import { IUserData } from '../types/userData.js'
@@ -14,21 +14,20 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   if (!userData) {
     return interaction.reply({
       content: 'Вы не авторизованы! Используйте команду `/login` для входа через Яндекс.',
-      ephemeral: true
+      flags: MessageFlags.Ephemeral
     })
   }
 
   const userEmbed = new EmbedBuilder()
     .setColor('#86cecb')
     .setTitle('Информация о вашем аккаунте Яндекс')
-    .setThumbnail(`https://avatars.mds.yandex.net/get-yapic/${userData.avatarUrl}/islands-retina-50`)
     .addFields(
       {
         name: 'Имя пользователя',
         value: userData.fullName || 'Нет данных',
         inline: true
       },
-      { name: 'Ник', value: userData.nickName, inline: true },
+      { name: 'Ник', value: userData.nickName || 'Нет данных', inline: true },
       { name: 'Плюс', value: userData.hasPlus ? 'активен' : 'отсутствует', inline: true }
     )
     .setFooter({
@@ -36,5 +35,9 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     })
     .setTimestamp()
 
-  return interaction.reply({ embeds: [userEmbed], ephemeral: true })
+  if (userData.avatarUrl) {
+    userEmbed.setThumbnail(`https://avatars.mds.yandex.net/get-yapic/${userData.avatarUrl}/islands-retina-50`)
+  }
+
+  return interaction.reply({ embeds: [userEmbed], flags: MessageFlags.Ephemeral })
 }

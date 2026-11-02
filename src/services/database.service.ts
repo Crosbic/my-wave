@@ -40,6 +40,14 @@ export class DatabaseService {
       )
     `)
 
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS guild_settings (
+        guild_id TEXT PRIMARY KEY,
+        public_buttons_access BOOLEAN NOT NULL DEFAULT 0,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `)
+
     console.log('База данных инициализирована')
   }
 
@@ -120,6 +128,24 @@ export class DatabaseService {
         hasPlus: !!row.has_plus
       }
     }
+  }
+
+  getPublicButtonsAccess(guildId: string): boolean {
+    const stmt = this.db.prepare('SELECT public_buttons_access FROM guild_settings WHERE guild_id = ?')
+    const row = stmt.get(guildId) as { public_buttons_access: number } | undefined
+    return !!row?.public_buttons_access
+  }
+
+  setPublicButtonsAccess(guildId: string, enabled: boolean): void {
+    const stmt = this.db.prepare(`
+      INSERT INTO guild_settings (guild_id, public_buttons_access, updated_at)
+      VALUES (?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(guild_id) DO UPDATE SET
+        public_buttons_access = excluded.public_buttons_access,
+        updated_at = CURRENT_TIMESTAMP
+    `)
+
+    stmt.run(guildId, enabled ? 1 : 0)
   }
 
   get userCount(): number {

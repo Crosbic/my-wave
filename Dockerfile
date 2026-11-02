@@ -1,22 +1,30 @@
-FROM node:lts-alpine AS builder
+FROM node:24-bookworm AS builder
 
 WORKDIR /build
 
-COPY . .
+COPY package.json yarn.lock ./
+RUN yarn install --frozen-lockfile
 
-RUN yarn install && yarn build
+COPY tsconfig.json ./
+COPY src ./src
+RUN yarn build
 
-FROM node:lts-bullseye
+FROM node:24-bookworm
 
-ENV NODE_ENV production
-USER node
+ENV NODE_ENV=production
 
 WORKDIR /app
 
-COPY package.json ./
-
-RUN yarn install --production && yarn cache clean
+COPY package.json yarn.lock ./
+RUN yarn install --frozen-lockfile --production && yarn cache clean
 
 COPY --from=builder /build/dist ./dist
 
-CMD [ "yarn", "start" ]
+# База с токенами пользователей: монтируйте сюда volume, иначе она пропадёт при пересоздании контейнера
+RUN mkdir -p /app/data && chown node:node /app/data
+VOLUME /app/data
+
+USER node
+
+# Запуск напрямую через node, чтобы SIGTERM доходил до бота и он корректно завершал работу
+CMD [ "node", "dist/index.js" ]

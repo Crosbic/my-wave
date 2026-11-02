@@ -30,16 +30,8 @@ const rest = new REST().setToken(config.token)
   try {
     console.log(`Начинаем регистрацию ${commands.length} слеш-команд.`)
 
-    let data
-    if (config.devGuildId) {
-      data = await rest.put(Routes.applicationGuildCommands(config.clientId, config.devGuildId), {
-        body: commands
-      })
-      console.log(`Успешно зарегистрировано ${(data as any[]).length} команд на сервере разработки.`)
-    } else {
-      data = await rest.put(Routes.applicationCommands(config.clientId), { body: commands })
-      console.log(`Успешно зарегистрировано ${(data as any[]).length} глобальных команд.`)
-    }
+    const data = await rest.put(Routes.applicationCommands(config.clientId), { body: commands })
+    console.log(`Успешно зарегистрировано ${(data as any[]).length} глобальных команд.`)
   } catch (error) {
     console.error(error)
   }

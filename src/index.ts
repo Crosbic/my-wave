@@ -8,11 +8,15 @@ import { Agent } from 'undici'
 
 import config from './config.js'
 import { DatabaseService } from './services/database.service.js'
+import { PlayerService } from './services/player.service.js'
+import { describeError } from './utils/errors.js'
+import { respond } from './utils/interactions.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
 const db = DatabaseService.getInstance()
+const playerService = PlayerService.getInstance()
 
 declare module 'discord.js' {
   interface Client {
@@ -26,14 +30,9 @@ const agent = new Agent({
   }
 })
 
+// Боту нужны только серверы и голосовые состояния, привилегированные интенты не требуются
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.GuildVoiceStates
-  ],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
   rest: {
     timeout: 60_000,
     agent
@@ -71,6 +70,11 @@ for (const file of eventFiles) {
 }
 
 client.on(Events.InteractionCreate, async interaction => {
+  if (interaction.isButton()) {
+    await playerService.handleButton(interaction)
+    return
+  }
+
   if (!interaction.isChatInputCommand()) return
 
   const command = client.commands.get(interaction.commandName)
@@ -83,35 +87,46 @@ client.on(Events.InteractionCreate, async interaction => {
   try {
     await command.execute(interaction)
   } catch (error) {
-    console.error(error)
-
-    const replyOptions = {
-      content: 'Произошла ошибка при выполнении команды!',
-      ephemeral: true
-    }
-
-    if (interaction.replied || interaction.deferred) {
-      await interaction.followUp(replyOptions)
-    } else {
-      await interaction.reply(replyOptions)
-    }
+    console.error(`Ошибка при выполнении команды /${interaction.commandName}:`, describeError(error))
+    await respond(interaction, 'Произошла ошибка при выполнении команды!')
   }
 })
 
-client.once(Events.ClientReady, readyClient => {
-  console.log(`Бот запущен как ${readyClient.user.tag}`)
+// Без этих обработчиков любая необработанная ошибка в обработчике событий завершает процесс
+client.on(Events.Error, error => {
+  console.error('Ошибка клиента Discord:', describeError(error))
 })
 
-client.login(config.token).then(_ => console.log('Логин по токену успешен'))
-
-process.on('SIGINT', () => {
-  console.log('Получен сигнал завершения работы, закрываем соединение с базой данных...')
-  db.close()
-  process.exit(0)
+process.on('unhandledRejection', reason => {
+  console.error('Необработанная ошибка:', describeError(reason))
 })
 
-process.on('SIGTERM', () => {
-  console.log('Получен сигнал завершения работы, закрываем соединение с базой данных...')
-  db.close()
-  process.exit(0)
-})
+client
+  .login(config.token)
+  .then(() => console.log('Логин по токену успешен'))
+  .catch(error => {
+    console.error('Не удалось войти в Discord:', describeError(error))
+    process.exit(1)
+  })
+
+let isShuttingDown = false
+
+async function shutdown(signal: NodeJS.Signals) {
+  if (isShuttingDown) return
+  isShuttingDown = true
+
+  console.log(`Получен сигнал ${signal}, останавливаем плееры и закрываем соединение с базой данных...`)
+
+  try {
+    await playerService.destroyAll('Бот перезапускается.')
+    await client.destroy()
+  } catch (error) {
+    console.error('Ошибка при завершении работы:', describeError(error))
+  } finally {
+    db.close()
+    process.exit(0)
+  }
+}
+
+process.on('SIGINT', signal => void shutdown(signal))
+process.on('SIGTERM', signal => void shutdown(signal))

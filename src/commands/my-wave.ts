@@ -1,151 +1,81 @@
-import { ChatInputCommandInteraction, SlashCommandBuilder, GuildMember } from 'discord.js'
+import { ChatInputCommandInteraction, MessageFlags, PermissionFlagsBits, SlashCommandBuilder } from 'discord.js'
 
 import { DatabaseService } from '../services/database.service.js'
 import { PlayerService } from '../services/player.service.js'
-import { YandexMusicService } from '../services/yandex-music.service.js'
+import { UserFacingError } from '../utils/errors.js'
+import { respond } from '../utils/interactions.js'
 
 export const data = new SlashCommandBuilder()
   .setName('my-wave')
   .setDescription('Воспроизвести треки из "Моя волна" в Яндекс Музыке')
 
 export async function execute(interaction: ChatInputCommandInteraction) {
-  const userId = interaction.user.id
-  const db = DatabaseService.getInstance()
-  const playerService = PlayerService.getInstance()
-  const yandexMusicService = YandexMusicService.getInstance()
-
-  if (!db.hasUserToken(userId)) {
-    await interaction.reply({
-      content: 'Вы не авторизованы! Используйте команду `/login` для входа через Яндекс.',
-      ephemeral: true
-    })
+  if (!interaction.inCachedGuild() || !interaction.channel) {
+    await respond(interaction, 'Эта команда может быть использована только на сервере.')
     return
   }
 
-  const userData = db.getUserData(userId)
+  const userData = DatabaseService.getInstance().getUserData(interaction.user.id)
   if (!userData) {
-    await interaction.reply({
-      content:
-        'Не удалось получить данные вашего аккаунта. Попробуйте выйти и войти снова с помощью команд `/logout` и `/login`.',
-      ephemeral: true
-    })
+    await respond(interaction, 'Вы не авторизованы! Используйте команду `/login` для входа через Яндекс.')
     return
   }
 
-  if (!interaction.guild) {
-    await interaction.reply({
-      content: 'Эта команда может быть использована только на сервере.',
-      ephemeral: true
-    })
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral })
+
+  const { guild } = interaction
+  const voiceState =
+    guild.voiceStates.cache.get(interaction.user.id) ??
+    (await guild.voiceStates.fetch(interaction.user.id).catch(() => null))
+  const voiceChannel = voiceState?.channel
+  if (!voiceChannel) {
+    await respond(interaction, 'Вы должны находиться в голосовом канале, чтобы использовать эту команду!')
     return
   }
 
-  const member = interaction.member as GuildMember
-  console.log(member.voice.channelId)
-
-  if (!member.voice?.channel) {
-    const updatedMember = await interaction.guild.members
-      .fetch({
-        user: interaction.user.id,
-        force: true // Принудительно обновляем данные, игнорируя кэш
-      })
-      .catch(() => null)
-
-    if (!updatedMember?.voice.channel) {
-      await interaction.reply({
-        content: 'Вы должны находиться в голосовом канале, чтобы использовать эту команду!',
-        ephemeral: true
-      })
-      return
-    }
+  const me = guild.members.me ?? (await guild.members.fetchMe())
+  const voicePermissions = voiceChannel.permissionsFor(me)
+  if (
+    !voicePermissions.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect, PermissionFlagsBits.Speak])
+  ) {
+    await respond(interaction, 'У меня нет прав для подключения или воспроизведения аудио в этом голосовом канале!')
+    return
   }
-
-  const voiceChannel: any =
-    member.voice?.channel ||
-    (
-      await interaction.guild.members.fetch({
-        user: interaction.user.id,
-        force: true
-      })
-    ).voice.channel
-
-  const permissions = voiceChannel.permissionsFor(interaction.client.user.id)
-  if (!permissions?.has('Connect') || !permissions?.has('Speak')) {
-    await interaction.reply({
-      content: 'У меня нет прав для подключения или воспроизведения аудио в этом голосовом канале!',
-      ephemeral: true
-    })
+  if (voiceChannel.full && !voicePermissions.has(PermissionFlagsBits.MoveMembers)) {
+    await respond(interaction, 'Голосовой канал заполнен, я не могу к нему подключиться.')
     return
   }
 
-  await interaction.reply({
-    content: `Подключаюсь к голосовому каналу "${voiceChannel.name}"...`,
-    ephemeral: true
-  })
+  const textChannel = interaction.channel
+  const sendPermission = textChannel.isThread()
+    ? PermissionFlagsBits.SendMessagesInThreads
+    : PermissionFlagsBits.SendMessages
+  if (
+    !interaction.appPermissions.has([PermissionFlagsBits.ViewChannel, sendPermission, PermissionFlagsBits.EmbedLinks])
+  ) {
+    await respond(
+      interaction,
+      'Мне не хватает прав в этом текстовом канале, чтобы показать плеер: нужны «Просмотр канала», «Отправка сообщений» и «Встраивать ссылки».'
+    )
+    return
+  }
+
+  await respond(interaction, `Подключаюсь к голосовому каналу «${voiceChannel.name}»...`)
 
   try {
-    const { accessToken } = userData
-    const stationId = 'user:onyourwave'
-
-    const playerStatus = playerService.isPlayerActive(interaction.guild.id)
-    if (playerStatus.active && playerStatus.discordUserId !== interaction.user.id) {
-      await interaction.followUp({
-        content:
-          'В данный момент плеер уже используется другим пользователем. Дождитесь, пока он остановит воспроизведение.',
-        ephemeral: true
-      })
+    await PlayerService.getInstance().startWave({
+      user: interaction.user,
+      voiceChannel,
+      textChannel,
+      yandexId: userData.userInfo.id,
+      accessToken: userData.accessToken
+    })
+    await respond(interaction, `«Моя волна» запущена в канале «${voiceChannel.name}».`)
+  } catch (error) {
+    if (error instanceof UserFacingError) {
+      await respond(interaction, error.message)
       return
     }
-
-    const { player, connection, embedMessage } = await playerService.createPlayer({
-      interaction,
-      voiceChannel,
-      accessToken,
-      userId: userData.userInfo.id,
-      stationId
-    })
-
-    try {
-      await yandexMusicService.getStationInfo(accessToken, stationId)
-      await yandexMusicService.sendStationStartedFeedback(accessToken, stationId)
-
-      const tracks = await yandexMusicService.getStationTracks(accessToken, stationId)
-      if (!tracks || tracks.length === 0) {
-        connection.destroy()
-        await interaction.followUp({
-          content: 'Не удалось получить треки из "Моя волна".',
-          ephemeral: true
-        })
-        return
-      }
-
-      const firstTrack = tracks[0]
-      const trackInfo = yandexMusicService.trackToTrackInfo(firstTrack)
-
-      const success = await playerService.playTrack(player, trackInfo, accessToken, stationId, embedMessage)
-      if (!success) {
-        connection.destroy()
-        await interaction.followUp({
-          content: 'Не удалось воспроизвести трек.',
-          ephemeral: true
-        })
-        return
-      }
-
-      playerService.setupInfinitePlayback(player, accessToken, stationId, embedMessage, tracks.slice(1))
-    } catch (apiError: any) {
-      console.error('Ошибка при работе с API Яндекс Музыки:', apiError)
-      connection.destroy()
-      await interaction.followUp({
-        content: `Произошла ошибка при взаимодействии с API Яндекс Музыки: ${apiError.message || 'Неизвестная ошибка'}`,
-        ephemeral: true
-      })
-    }
-  } catch (connectionError: any) {
-    console.error('Ошибка при подключении к голосовому каналу:', connectionError)
-    await interaction.followUp({
-      content: `Произошла ошибка при подключении к голосовому каналу: ${connectionError.message || 'Неизвестная ошибка'}`,
-      ephemeral: true
-    })
+    throw error
   }
 }
