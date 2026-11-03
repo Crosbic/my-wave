@@ -1,34 +1,95 @@
 import crypto from 'crypto'
+import { setTimeout as sleep } from 'timers/promises'
 
-import axios, { isAxiosError } from 'axios'
+import axios, { AxiosInstance, InternalAxiosRequestConfig, isAxiosError } from 'axios'
 
 import { YandexAuthError } from '../errors/yandexAuthError.js'
 import { IUserData } from '../types/userData.js'
-import { IStationBatch, IYandexTrack } from '../types/yandexTrack.js'
+import { WaveSettingGroup, WaveSettingKey } from '../types/waveSettings.js'
+import { IStationBatch, IWaveSession, IYandexTrack } from '../types/yandexTrack.js'
 import { logger } from '../utils/logger.js'
 
 import type { components, operations } from '../types/yandex-api.js'
 
 const API_URL = 'https://api.music.yandex.net'
 const REQUEST_TIMEOUT = 15_000
+// Отказ 429 («Concurrency limit exceeded») кратковременный: через секунду-две тот же запрос проходит
+const RATE_LIMIT_RETRIES = 2
+const RATE_LIMIT_DELAY = 1_000
+const MAX_RATE_LIMIT_DELAY = 5_000
 
 // Соль для подписи прямой ссылки на файл, как в эталонном клиенте MarshalX/yandex-music-api
 const SIGN_SALT = 'XGRlBW9FXlekgbPrRHuSiA'
 const FEEDBACK_FROM = 'ym-player-bot'
+
+// Занятия приходят списком станций без названия группы, а у «Любого» нет значения в ответе API
+const ACTIVITY_GROUP_NAME = 'Под занятие'
+const ANY_VALUE_NAME = 'Любое'
+const RESTRICTION_KEYS = ['diversity', 'moodEnergy', 'language'] as const
 
 const log = logger.child('yandex')
 
 // Типы запросов и ответов сгенерированы из спецификации API (yarn api:generate):
 // опечатка в имени параметра или поля запроса не скомпилируется
 type ApiTrack = components['schemas']['Track']
+type SequenceItem = components['schemas']['SequenceItem']
 type DownloadVariant = components['schemas']['TrackDownloadInfo']
 type AccountStatusResponse = operations['getAccountStatus']['responses'][200]['content']['application/json']
-type StationTracksQuery = NonNullable<operations['getStationTracks']['parameters']['query']>
-type StationTracksResponse = operations['getStationTracks']['responses'][200]['content']['application/json']
-type FeedbackQuery = NonNullable<operations['sendStationFeedback']['parameters']['query']>
-type FeedbackBody = operations['sendStationFeedback']['requestBody']['content']['application/json']
 type DownloadInfoResponse = operations['getDownloadInfo']['responses'][200]['content']['application/json']
 type LikeTracksForm = operations['likeTracks']['requestBody']['content']['application/x-www-form-urlencoded']
+
+// Сессий волны и её настроек в спецификации нет. Форматы взяты из запросов веб-клиента Яндекс Музыки
+interface WaveSessionBody {
+  seeds: string[]
+  queue?: string[]
+  includeTracksInResponse: boolean
+  includeWaveModel: boolean
+  interactive: boolean
+}
+
+interface WaveTracksBody {
+  queue: string[]
+}
+
+interface WaveFeedbackBody {
+  event: {
+    type: WaveFeedback['type']
+    timestamp: string
+    from?: string
+    trackId?: string
+    totalPlayedSeconds?: number
+  }
+  batchId?: string
+  from: string
+}
+
+interface ApiWaveBatch {
+  batchId?: string
+  sequence?: SequenceItem[]
+}
+
+interface ApiWaveSession extends ApiWaveBatch {
+  radioSessionId: string
+}
+
+interface ApiWaveTracks extends ApiWaveBatch {
+  terminated?: boolean
+  unknownSession?: boolean
+}
+
+interface ApiWaveValue {
+  value: string
+  name: string
+  serializedSeed?: string
+  unspecified?: boolean
+}
+
+interface ApiWaveSettings {
+  blocks?: { type: string; items?: { id: { type: string; tag: string }; name: string }[] }[]
+  settingRestrictions?: Partial<
+    Record<Exclude<WaveSettingKey, 'activity'>, { name: string; possibleValues?: ApiWaveValue[] }>
+  >
+}
 
 // Ответы, которых нет в спецификации
 interface ILoginInfo {
@@ -49,18 +110,25 @@ interface IDirectLinkInfo {
 }
 
 /**
- * Фидбэк станции. batchId передаётся как batch-id и должен отсутствовать для radioStarted
+ * Фидбэк сессии волны. У radioStarted нет трека и batchId
  */
-export type StationFeedback =
+export type WaveFeedback =
   | { type: 'radioStarted' }
   | { type: 'trackStarted'; trackId: string; batchId: string | null }
   | { type: 'trackFinished' | 'skip'; trackId: string; batchId: string | null; totalPlayedSeconds: number }
 
 export class YandexMusicService {
   private static instance: YandexMusicService
-  private readonly http = axios.create({ baseURL: API_URL, timeout: REQUEST_TIMEOUT })
+  // Названия настроек волны приходят на языке из Accept-Language
+  private readonly http = axios.create({
+    baseURL: API_URL,
+    timeout: REQUEST_TIMEOUT,
+    headers: { 'Accept-Language': 'ru' }
+  })
 
-  private constructor() {}
+  private constructor() {
+    retryOnRateLimit(this.http)
+  }
 
   public static getInstance(): YandexMusicService {
     if (!YandexMusicService.instance) {
@@ -70,7 +138,7 @@ export class YandexMusicService {
   }
 
   /**
-   * Идентификатор трека в формате «трек:альбом», который ждут фидбэк станции, параметр queue и лайки
+   * Идентификатор трека в формате «трек:альбом», который ждут фидбэк волны, параметр queue и лайки
    */
   public static fullTrackId(track: IYandexTrack): string {
     const albumId = track.albums[0]?.id
@@ -112,56 +180,90 @@ export class YandexMusicService {
   }
 
   /**
-   * Получение следующей партии треков станции.
-   * queue — идентификатор трека, который только что играл: по нему станция продолжает волну, а не начинает заново
+   * Настройки «Моей волны»: занятия и значения характера, настроения и языка
    */
-  public async getStationTracks(token: string, stationId: string, queue?: string): Promise<IStationBatch> {
-    const params: StationTracksQuery = { settings2: true, queue }
-
+  public async getWaveSettings(token: string): Promise<WaveSettingGroup[]> {
     try {
-      const response = await this.http.get<StationTracksResponse>(`/rotor/station/${stationId}/tracks`, {
-        headers: this.authHeaders(token),
-        params
+      const response = await this.http.get<{ result: ApiWaveSettings }>('/rotor/wave/settings', {
+        headers: this.authHeaders(token)
       })
-
-      const { batchId, sequence } = response.data.result
-      const tracks = (sequence ?? [])
-        .map(item => item.track)
-        .filter(track => track && track.available)
-        .map(track => this.toTrack(track))
-
-      return { batchId: batchId ?? null, tracks }
+      return this.toWaveSettingGroups(response.data.result)
     } catch (error) {
       throw this.wrapError(error)
     }
   }
 
   /**
-   * Отправка фидбэка станции. Ошибки только логируются: фидбэк не должен мешать воспроизведению
+   * Новая сессия волны с первой партией треков. Сиды задают волну и её настройки.
+   * queue — последние сыгранные треки: волна продолжит после них и не повторит их
    */
-  public async sendStationFeedback(token: string, stationId: string, feedback: StationFeedback): Promise<boolean> {
-    const body: FeedbackBody = {
-      type: feedback.type,
-      timestamp: new Date().toISOString().replace('Z', ''),
+  public async createWaveSession(token: string, seeds: string[], queue: string[] = []): Promise<IWaveSession> {
+    const body: WaveSessionBody = {
+      seeds,
+      ...(queue.length > 0 && { queue }),
+      includeTracksInResponse: true,
+      includeWaveModel: true,
+      interactive: true
+    }
+
+    try {
+      const response = await this.http.post<{ result: ApiWaveSession }>('/rotor/session/new', body, {
+        headers: this.authHeaders(token)
+      })
+      const { radioSessionId, ...batch } = response.data.result
+      return { sessionId: radioSessionId, ...this.toBatch(batch) }
+    } catch (error) {
+      throw this.wrapError(error)
+    }
+  }
+
+  /**
+   * Следующая партия треков сессии волны. null — Яндекс Музыка завершила сессию или не знает её, нужна новая
+   */
+  public async getWaveTracks(token: string, sessionId: string, queue: string[]): Promise<IStationBatch | null> {
+    const body: WaveTracksBody = { queue }
+
+    try {
+      const response = await this.http.post<{ result: ApiWaveTracks }>(
+        `/rotor/session/${encodeURIComponent(sessionId)}/tracks`,
+        body,
+        { headers: this.authHeaders(token) }
+      )
+      const result = response.data.result
+      return result.unknownSession || result.terminated ? null : this.toBatch(result)
+    } catch (error) {
+      throw this.wrapError(error)
+    }
+  }
+
+  /**
+   * Отправка фидбэка сессии волны. Ошибки только логируются: фидбэк не должен мешать воспроизведению
+   */
+  public async sendWaveFeedback(token: string, sessionId: string, feedback: WaveFeedback): Promise<boolean> {
+    const body: WaveFeedbackBody = {
+      event: { type: feedback.type, timestamp: new Date().toISOString() },
       from: FEEDBACK_FROM
     }
-    let params: FeedbackQuery | undefined
 
-    if (feedback.type !== 'radioStarted') {
-      body.trackId = feedback.trackId
-      if (feedback.batchId) {
-        params = { 'batch-id': feedback.batchId }
-      }
+    if (feedback.type === 'radioStarted') {
+      body.event.from = FEEDBACK_FROM
+    } else {
+      body.event.trackId = feedback.trackId
       if (feedback.type !== 'trackStarted') {
-        body.totalPlayedSeconds = feedback.totalPlayedSeconds
+        body.event.totalPlayedSeconds = feedback.totalPlayedSeconds
+      }
+      if (feedback.batchId) {
+        body.batchId = feedback.batchId
       }
     }
 
     try {
-      await this.http.post(`/rotor/station/${stationId}/feedback`, body, { headers: this.authHeaders(token), params })
+      await this.http.post(`/rotor/session/${encodeURIComponent(sessionId)}/feedback`, body, {
+        headers: this.authHeaders(token)
+      })
       return true
     } catch (error) {
-      log.warn(`Не удалось отправить фидбэк ${feedback.type} станции ${stationId}`, error)
+      log.warn(`Не удалось отправить фидбэк ${feedback.type} сессии волны`, error)
       return false
     }
   }
@@ -246,6 +348,52 @@ export class YandexMusicService {
     )[0]
   }
 
+  private toBatch({ batchId, sequence }: ApiWaveBatch): IStationBatch {
+    const tracks = (sequence ?? [])
+      .map(item => item.track)
+      .filter(track => track && track.available)
+      .map(track => this.toTrack(track))
+
+    return { batchId: batchId ?? null, tracks }
+  }
+
+  /**
+   * Группы настроек в порядке приложения: занятие, характер, настроение, язык.
+   * «Любое» (unspecified) сидом не передаётся, от него остаётся только название
+   */
+  private toWaveSettingGroups(settings: ApiWaveSettings): WaveSettingGroup[] {
+    const groups: WaveSettingGroup[] = []
+
+    const contexts = settings.blocks?.find(block => block.type === 'contexts')?.items ?? []
+    if (contexts.length > 0) {
+      groups.push({
+        key: 'activity',
+        name: ACTIVITY_GROUP_NAME,
+        anyName: ANY_VALUE_NAME,
+        options: contexts.map(item => ({ seed: `${item.id.type}:${item.id.tag}`, name: item.name }))
+      })
+    }
+
+    for (const key of RESTRICTION_KEYS) {
+      const restriction = settings.settingRestrictions?.[key]
+      const values = restriction?.possibleValues ?? []
+      const options = values.flatMap(value =>
+        !value.unspecified && value.serializedSeed ? [{ seed: value.serializedSeed, name: value.name }] : []
+      )
+
+      if (restriction && options.length > 0) {
+        groups.push({
+          key,
+          name: restriction.name,
+          anyName: values.find(value => value.unspecified)?.name ?? ANY_VALUE_NAME,
+          options
+        })
+      }
+    }
+
+    return groups
+  }
+
   private toTrack(track: ApiTrack): IYandexTrack {
     return {
       id: String(track.id),
@@ -267,6 +415,50 @@ export class YandexMusicService {
     }
     return error
   }
+}
+
+type RateLimitedConfig = InternalAxiosRequestConfig & { rateLimitAttempt?: number }
+
+/**
+ * Повтор запросов, на которые Яндекс Музыка ответила 429. Пауза растёт с каждой попыткой,
+ * а если API прислал Retry-After, берётся она (но не дольше MAX_RATE_LIMIT_DELAY)
+ */
+export function retryOnRateLimit(
+  http: AxiosInstance,
+  { retries = RATE_LIMIT_RETRIES, delay = RATE_LIMIT_DELAY } = {}
+): void {
+  http.interceptors.response.use(undefined, async (error: unknown) => {
+    const config = isAxiosError(error) ? (error.config as RateLimitedConfig | undefined) : undefined
+    if (!isAxiosError(error) || error.response?.status !== 429 || !config) {
+      throw error
+    }
+
+    const attempt = (config.rateLimitAttempt ?? 0) + 1
+    if (attempt > retries) {
+      throw error
+    }
+
+    config.rateLimitAttempt = attempt
+    const wait = retryAfter(error.response.headers['retry-after']) ?? attempt * delay
+    log.warn(
+      `Яндекс Музыка ответила 429, повтор ${attempt}/${retries} через ${wait} мс: ` +
+        `${config.method?.toUpperCase()} ${config.url?.split('?')[0]}`
+    )
+    await sleep(wait)
+    return http.request(config)
+  })
+}
+
+/**
+ * Пауза из заголовка Retry-After в миллисекундах. Поддерживается только число секунд
+ */
+function retryAfter(header: unknown): number | undefined {
+  if (typeof header !== 'string' || header.trim() === '') {
+    return undefined
+  }
+
+  const seconds = Number(header)
+  return Number.isFinite(seconds) && seconds >= 0 ? Math.min(seconds * 1000, MAX_RATE_LIMIT_DELAY) : undefined
 }
 
 /**

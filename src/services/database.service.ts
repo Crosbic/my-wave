@@ -4,8 +4,10 @@ import { fileURLToPath } from 'url'
 
 import Database from 'better-sqlite3'
 
+import { parseWaveChoice } from './wave-settings.js'
 import config from '../config.js'
 import { IUserData } from '../types/userData.js'
+import { WaveChoice } from '../types/waveSettings.js'
 import { decrypt, encrypt, isEncrypted } from '../utils/crypto.js'
 import { logger } from '../utils/logger.js'
 
@@ -95,6 +97,20 @@ const MIGRATIONS: Migration[] = [
           update.run(encrypt(row.access_token), row.discord_id)
         }
       }
+    }
+  },
+  {
+    version: 3,
+    description: 'последние настройки «Моей волны» пользователей',
+    up: db => {
+      // Отдельно от users: настройки переживают /logout и повторный вход
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS wave_settings (
+          discord_id TEXT PRIMARY KEY,
+          choice TEXT NOT NULL,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `)
     }
   }
 ]
@@ -245,6 +261,36 @@ export class DatabaseService {
     `)
 
     stmt.run(guildId, enabled ? 1 : 0)
+  }
+
+  /**
+   * Последние настройки «Моей волны», с которыми пользователь её запускал. Без сохранённых — всё «Любое»
+   */
+  getWaveChoice(discordId: string): WaveChoice {
+    const stmt = this.db.prepare('SELECT choice FROM wave_settings WHERE discord_id = ?')
+    const row = stmt.get(discordId) as { choice: string } | undefined
+    if (!row) {
+      return {}
+    }
+
+    try {
+      return parseWaveChoice(JSON.parse(row.choice))
+    } catch (error) {
+      log.warn(`Не удалось прочитать настройки волны пользователя ${discordId}`, error)
+      return {}
+    }
+  }
+
+  saveWaveChoice(discordId: string, choice: WaveChoice): void {
+    const stmt = this.db.prepare(`
+      INSERT INTO wave_settings (discord_id, choice, updated_at)
+      VALUES (?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(discord_id) DO UPDATE SET
+        choice = excluded.choice,
+        updated_at = CURRENT_TIMESTAMP
+    `)
+
+    stmt.run(discordId, JSON.stringify(choice))
   }
 
   get userCount(): number {

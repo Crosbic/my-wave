@@ -31,14 +31,18 @@ import {
   VoiceConnectionStatus
 } from '@discordjs/voice'
 
-import { StationFeedback, YandexMusicService } from './yandex-music.service.js'
+import { describeChoice, isDefaultChoice, waveSeeds } from './wave-settings.js'
+import { WaveFeedback, YandexMusicService } from './yandex-music.service.js'
 import { YandexAuthError } from '../errors/yandexAuthError.js'
-import { IYandexTrack } from '../types/yandexTrack.js'
+import { WaveChoice } from '../types/waveSettings.js'
+import { IStationBatch, IWaveSession, IYandexTrack } from '../types/yandexTrack.js'
 import { UserFacingError } from '../utils/errors.js'
 import { Logger, logger } from '../utils/logger.js'
 
 const VOLUME = 0.8 // Чтоб не оглохли
 const HISTORY_SIZE = 10
+// Сколько последних треков передаём волне в queue, как веб-клиент Яндекс Музыки
+const RECENT_QUEUE_SIZE = 2
 // Сколько раз запускаем трек, если поток оборвался в первые retryWindow мс
 const MAX_TRACK_ATTEMPTS = 3
 // Сколько треков подряд может не воспроизвестись, прежде чем плеер остановится
@@ -79,14 +83,16 @@ const COLOR_STOPPED = '#FF0000'
 const FOOTER = 'Яндекс Музыка'
 
 export const WAVE_BUTTON_PREFIX = 'wave:'
-export type WaveAction = 'like' | 'previous' | 'pause' | 'resume' | 'stop' | 'next'
+export type WaveAction = 'like' | 'previous' | 'pause' | 'resume' | 'stop' | 'next' | 'settings' | 'reset'
 
 type EndReason = 'finished' | 'skip' | 'error'
 
 interface QueueItem {
   track: IYandexTrack
+  // Сессия волны и партия, из которых пришёл трек: фидбэк по треку уходит туда же, даже после смены настроек
+  sessionId: string
   batchId: string | null
-  // Фидбэк станции отправляется только для первого воспроизведения трека
+  // Фидбэк волны отправляется только для первого воспроизведения трека
   feedback: 'pending' | 'started' | 'done'
 }
 
@@ -106,7 +112,7 @@ export interface WaveSessionOptions {
   voiceChannel: VoiceBasedChannel
   textChannel: GuildTextBasedChannel
   owner: WaveOwner
-  stationId: string
+  choice: WaveChoice
   onDestroy: (session: WaveSession) => void
   timings?: Partial<WaveTimings>
 }
@@ -120,7 +126,6 @@ export class WaveSession {
   readonly owner: WaveOwner
 
   private readonly guild: Guild
-  private readonly stationId: string
   private readonly connection: VoiceConnection
   private readonly player: AudioPlayer
   private readonly onDestroy: (session: WaveSession) => void
@@ -130,12 +135,14 @@ export class WaveSession {
   private readonly activityTimer: NodeJS.Timeout
 
   private message: Message | null
+  private choice: WaveChoice
+  // Сессия волны в Яндекс Музыке. Создаётся при первой загрузке треков и заново, если Яндекс Музыка её завершила
+  private radioSessionId: string | null = null
   private readonly queue: QueueItem[] = []
   private readonly history: QueueItem[] = []
   // Треки, к которым вернёмся после ⏮️: последний элемент играет следующим
   private readonly upcoming: QueueItem[] = []
   private current: Playback | null = null
-  private lastPlayedTrackId: string | undefined
   private failedResource: AudioResource | null = null
   private failedTracks = 0
 
@@ -159,7 +166,7 @@ export class WaveSession {
     this.guild = options.voiceChannel.guild
     this.guildId = this.guild.id
     this.owner = options.owner
-    this.stationId = options.stationId
+    this.choice = options.choice
     this.onDestroy = options.onDestroy
     this.timings = { ...DEFAULT_TIMINGS, ...options.timings }
     this.log = logger.child(`guild ${this.guildId}`)
@@ -212,8 +219,13 @@ export class WaveSession {
     let message: Message
     try {
       message = await textChannel.send({
-        embeds: [loadingEmbed()],
-        components: [controlsRow({ paused: false, hasTrack: false, hasPrevious: false })]
+        embeds: [loadingEmbed(options.choice)],
+        components: controlsRows({
+          paused: false,
+          hasTrack: false,
+          hasPrevious: false,
+          hasSettings: !isDefaultChoice(options.choice)
+        })
       })
     } catch (error) {
       log.error('Не удалось отправить сообщение плеера', error)
@@ -240,13 +252,55 @@ export class WaveSession {
     return this.endReason
   }
 
+  get waveChoice(): WaveChoice {
+    return this.choice
+  }
+
   /**
    * Запуск волны. Возвращает false, если воспроизведение не началось: причина будет в stopReason
    */
   async start(): Promise<boolean> {
-    this.sendFeedback({ type: 'radioStarted' })
     await this.run(() => this.advance('finished'))
     return !this.destroyed && this.current !== null
+  }
+
+  /**
+   * Смена настроек на ходу: создаётся новая сессия волны, и сразу играет её первый трек.
+   * Если новую волну получить не удалось, продолжает играть прежняя. Возвращает, сменились ли настройки
+   */
+  async retune(choice: WaveChoice): Promise<boolean> {
+    let retuned = false
+
+    await this.run(async () => {
+      let radio: IWaveSession
+      try {
+        radio = await this.yandex.createWaveSession(this.owner.accessToken, waveSeeds(choice), this.recentTrackIds())
+      } catch (error) {
+        if (error instanceof YandexAuthError) {
+          throw error
+        }
+        this.log.error('Не удалось получить волну с новыми настройками', error)
+        return
+      }
+
+      const items = this.freshItems(radio.sessionId, radio)
+      if (items.length === 0) {
+        this.log.warn('Волна с новыми настройками не вернула новых треков')
+        return
+      }
+
+      this.choice = choice
+      this.adoptRadio(radio.sessionId)
+      // Треки прежней волны больше не нужны, в том числе те, к которым вела ⏭️ после ⏮️
+      this.queue.splice(0, this.queue.length, ...items)
+      this.upcoming.length = 0
+      this.log.info(`Настройки волны: ${describeChoice(choice) || 'по умолчанию'}`)
+
+      retuned = true
+      await this.advance('skip')
+    })
+
+    return retuned
   }
 
   async skip(): Promise<void> {
@@ -421,36 +475,85 @@ export class WaveSession {
   }
 
   /**
-   * Загрузка следующей партии треков. Станции передаётся трек, который только что играл, чтобы она продолжила волну
+   * Загрузка следующей партии треков. Волне передаются последние сыгранные треки, чтобы она продолжилась, а не началась заново
    */
   private async loadBatch(): Promise<void> {
+    let queue = this.recentTrackIds()
+
     for (let attempt = 1; attempt <= BATCH_ATTEMPTS && !this.destroyed; attempt++) {
       try {
-        const batch = await this.yandex.getStationTracks(this.owner.accessToken, this.stationId, this.lastPlayedTrackId)
-        const recent = new Set(this.history.map(item => item.track.id))
-        const fresh = batch.tracks.filter(track => !recent.has(track.id))
+        const { sessionId, batch } = await this.fetchBatch(queue)
+        const items = this.freshItems(sessionId, batch)
 
-        this.queue.push(...fresh.map(track => ({ track, batchId: batch.batchId, feedback: 'pending' as const })))
-        if (fresh.length > 0) {
+        this.queue.push(...items)
+        if (items.length > 0) {
           return
         }
 
-        // Станция вернула только недавние треки: просим продолжение после последнего из них
-        const last = batch.tracks.at(-1)
-        if (last) {
-          this.lastPlayedTrackId = YandexMusicService.fullTrackId(last)
-        }
+        // Волна вернула только недавние треки: просим продолжение после них
+        queue = [...queue, ...batch.tracks.map(track => YandexMusicService.fullTrackId(track))]
       } catch (error) {
         if (error instanceof YandexAuthError) {
           throw error
         }
-        this.log.error(`Не удалось загрузить треки станции (попытка ${attempt}/${BATCH_ATTEMPTS})`, error)
+        this.log.error(`Не удалось загрузить треки волны (попытка ${attempt}/${BATCH_ATTEMPTS})`, error)
       }
 
       if (attempt < BATCH_ATTEMPTS) {
         await sleep(attempt * this.timings.retryDelay)
       }
     }
+  }
+
+  /**
+   * Партия из текущей сессии волны. Если сессии ещё нет или Яндекс Музыка её завершила,
+   * создаётся новая с теми же настройками
+   */
+  private async fetchBatch(queue: string[]): Promise<{ sessionId: string; batch: IStationBatch }> {
+    if (this.radioSessionId) {
+      const sessionId = this.radioSessionId
+      const batch = await this.yandex.getWaveTracks(this.owner.accessToken, sessionId, queue)
+      if (batch) {
+        return { sessionId, batch }
+      }
+
+      this.log.info('Яндекс Музыка завершила сессию волны, создаём новую')
+      this.radioSessionId = null
+    }
+
+    const radio = await this.yandex.createWaveSession(this.owner.accessToken, waveSeeds(this.choice), queue)
+    this.adoptRadio(radio.sessionId)
+    return { sessionId: radio.sessionId, batch: radio }
+  }
+
+  /**
+   * Новая сессия волны становится текущей: следующие партии запрашиваются у неё
+   */
+  private adoptRadio(sessionId: string): void {
+    this.radioSessionId = sessionId
+    this.sendFeedback(sessionId, { type: 'radioStarted' })
+  }
+
+  /**
+   * Треки партии без недавно сыгранных: волна иногда повторяет только что игравшие
+   */
+  private freshItems(sessionId: string, batch: IStationBatch): QueueItem[] {
+    const recent = new Set(this.history.map(item => item.track.id))
+    if (this.current) {
+      recent.add(this.current.item.track.id)
+    }
+
+    return batch.tracks
+      .filter(track => !recent.has(track.id))
+      .map(track => ({ track, sessionId, batchId: batch.batchId, feedback: 'pending' as const }))
+  }
+
+  /**
+   * Последние сыгранные треки для параметра queue: волна продолжится после них и не повторит их
+   */
+  private recentTrackIds(): string[] {
+    const played = this.current ? [...this.history, this.current.item] : this.history
+    return played.slice(-RECENT_QUEUE_SIZE).map(item => YandexMusicService.fullTrackId(item.track))
   }
 
   private remember(item: QueueItem): void {
@@ -500,8 +603,7 @@ export class WaveSession {
 
     item.feedback = 'started'
     const trackId = YandexMusicService.fullTrackId(item.track)
-    this.lastPlayedTrackId = trackId
-    this.sendFeedback({ type: 'trackStarted', trackId, batchId: item.batchId })
+    this.sendFeedback(item.sessionId, { type: 'trackStarted', trackId, batchId: item.batchId })
   }
 
   private async onTrackEnded(resource: AudioResource): Promise<void> {
@@ -541,20 +643,20 @@ export class WaveSession {
     }
 
     item.feedback = 'done'
-    this.sendFeedback({
+    this.sendFeedback(item.sessionId, {
       type: reason === 'skip' ? 'skip' : 'trackFinished',
       trackId: YandexMusicService.fullTrackId(item.track),
       batchId: item.batchId,
-      totalPlayedSeconds: Math.round(resource.playbackDuration / 1000)
+      totalPlayedSeconds: resource.playbackDuration / 1000
     })
   }
 
   /**
-   * Фидбэк отправляется строго по очереди, чтобы станция получала события в правильном порядке
+   * Фидбэк отправляется строго по очереди, чтобы волна получала события в правильном порядке
    */
-  private sendFeedback(feedback: StationFeedback): void {
+  private sendFeedback(sessionId: string, feedback: WaveFeedback): void {
     this.feedbackQueue = this.feedbackQueue.then(() =>
-      this.yandex.sendStationFeedback(this.owner.accessToken, this.stationId, feedback)
+      this.yandex.sendWaveFeedback(this.owner.accessToken, sessionId, feedback)
     )
   }
 
@@ -634,12 +736,16 @@ export class WaveSession {
     }
 
     const track = this.current?.item.track
-    const controls = controlsRow({
+    const controls = controlsRows({
       paused: this.player.state.status === AudioPlayerStatus.Paused,
       hasTrack: !!track,
-      hasPrevious: this.history.length > 0
+      hasPrevious: this.history.length > 0,
+      hasSettings: !isDefaultChoice(this.choice)
     })
-    return { embeds: [track ? nowPlayingEmbed(track) : loadingEmbed()], components: [controls] }
+    return {
+      embeds: [track ? nowPlayingEmbed(track, this.choice) : loadingEmbed(this.choice)],
+      components: controls
+    }
   }
 
   private async editMessage(options: MessageEditOptions): Promise<void> {
@@ -671,22 +777,22 @@ export function stoppedEmbed(reason: string): EmbedBuilder {
     .setTimestamp()
 }
 
-function loadingEmbed(): EmbedBuilder {
+function loadingEmbed(choice: WaveChoice): EmbedBuilder {
   return new EmbedBuilder()
     .setColor(COLOR_PLAYING)
     .setTitle('🎵 Сейчас играет')
-    .setDescription('Загрузка трека...')
+    .setDescription(`Загрузка трека...${waveLine(choice)}`)
     .setFooter({ text: FOOTER })
     .setTimestamp()
 }
 
-function nowPlayingEmbed(track: IYandexTrack): EmbedBuilder {
+function nowPlayingEmbed(track: IYandexTrack, choice: WaveChoice): EmbedBuilder {
   const album = track.albums[0]?.title || 'Неизвестный альбом'
   const embed = new EmbedBuilder()
     .setColor(COLOR_PLAYING)
     .setTitle('🎵 Сейчас играет')
     .setDescription(
-      `**${escapeMarkdown(track.title)}**\nИсполнитель: ${escapeMarkdown(formatArtists(track))}\nАльбом: ${escapeMarkdown(album)}`
+      `**${escapeMarkdown(track.title)}**\nИсполнитель: ${escapeMarkdown(formatArtists(track))}\nАльбом: ${escapeMarkdown(album)}${waveLine(choice)}`
     )
     .setFooter({ text: FOOTER })
     .setTimestamp()
@@ -697,23 +803,48 @@ function nowPlayingEmbed(track: IYandexTrack): EmbedBuilder {
   return embed
 }
 
+/**
+ * Строка с настройками волны, если хоть одна отличается от «Любое»
+ */
+function waveLine(choice: WaveChoice): string {
+  const description = describeChoice(choice)
+  return description ? `\nВолна: ${escapeMarkdown(description)}` : ''
+}
+
 interface ControlsState {
   paused: boolean
   hasTrack: boolean
   hasPrevious: boolean
+  // Волна играет не с «Любое» во всех группах: тогда настройки можно сбросить
+  hasSettings: boolean
 }
 
 /**
- * Кнопки плеера. Недоступные сейчас действия выключены, чтобы не объяснять их сообщениями
+ * Кнопки плеера. Недоступные сейчас действия выключены, чтобы не объяснять их сообщениями.
+ * В ряду помещается не больше пяти кнопок, поэтому настройки волны во втором ряду.
+ * Кнопка сброса появляется, только когда сбрасывать есть что
  */
-function controlsRow({ paused, hasTrack, hasPrevious }: ControlsState): ActionRowBuilder<ButtonBuilder> {
-  return new ActionRowBuilder<ButtonBuilder>().addComponents(
-    controlButton('like', '👍').setDisabled(!hasTrack),
-    controlButton('previous', '⏮️').setDisabled(!hasPrevious),
-    paused ? controlButton('resume', '▶️') : controlButton('pause', '⏸️').setDisabled(!hasTrack),
-    controlButton('stop', '⏹️'),
-    controlButton('next', '⏭️')
-  )
+function controlsRows({
+  paused,
+  hasTrack,
+  hasPrevious,
+  hasSettings
+}: ControlsState): ActionRowBuilder<ButtonBuilder>[] {
+  const waveRow = new ActionRowBuilder<ButtonBuilder>().addComponents(controlButton('settings', '⚙️ Настроить волну'))
+  if (hasSettings) {
+    waveRow.addComponents(controlButton('reset', '↩️ Сбросить настройки'))
+  }
+
+  return [
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      controlButton('like', '👍').setDisabled(!hasTrack),
+      controlButton('previous', '⏮️').setDisabled(!hasPrevious),
+      paused ? controlButton('resume', '▶️') : controlButton('pause', '⏸️').setDisabled(!hasTrack),
+      controlButton('stop', '⏹️'),
+      controlButton('next', '⏭️')
+    ),
+    waveRow
+  ]
 }
 
 function controlButton(action: WaveAction, label: string): ButtonBuilder {

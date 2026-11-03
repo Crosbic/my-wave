@@ -10,7 +10,7 @@ import { removeDir, tempDir } from './helpers.js'
 import { DatabaseService } from '../src/services/database.service.js'
 import { encrypt, isEncrypted } from '../src/utils/crypto.js'
 
-const LATEST_SCHEMA_VERSION = 2
+const LATEST_SCHEMA_VERSION = 3
 const dirs: string[] = []
 
 after(() => dirs.forEach(removeDir))
@@ -163,6 +163,43 @@ describe('DatabaseService', () => {
     assert.ok(!files.includes('users.db'))
     assert.ok(files.some(name => name.startsWith('users.db.migrated-')))
     assert.ok(storedTokens(dir).every(isEncrypted))
+  })
+
+  it('запоминает настройки волны, а повреждённую запись читает как «Любое»', () => {
+    const dir = newDir('db-wave-choice')
+    const choice = {
+      activity: { seed: 'activity:workout', name: 'Тренируюсь' },
+      language: { seed: 'settingLanguage:russian', name: 'Русский' }
+    }
+
+    const db = DatabaseService.open(dir)
+    assert.deepEqual(db.getWaveChoice('user'), {}, 'без сохранённого выбора всё «Любое»')
+    db.saveWaveChoice('user', choice)
+    assert.deepEqual(db.getWaveChoice('user'), choice)
+    db.saveWaveChoice('other', {})
+    assert.deepEqual(db.getWaveChoice('other'), {})
+    db.close()
+
+    const raw = new Database(path.join(dir, 'data.db'))
+    const insert = raw.prepare('INSERT INTO wave_settings (discord_id, choice) VALUES (?, ?)')
+    insert.run('broken', '{not json')
+    insert.run(
+      'partial',
+      JSON.stringify({
+        moodEnergy: { seed: 'settingMoodEnergy:fun', name: 'Весёлое' },
+        language: { seed: 1 },
+        unknown: { seed: 'x', name: 'y' }
+      })
+    )
+    raw.close()
+
+    const reopened = DatabaseService.open(dir)
+    assert.deepEqual(reopened.getWaveChoice('broken'), {})
+    assert.deepEqual(reopened.getWaveChoice('partial'), {
+      moodEnergy: { seed: 'settingMoodEnergy:fun', name: 'Весёлое' }
+    })
+    assert.deepEqual(reopened.getWaveChoice('user'), choice, 'выбор пережил перезапуск')
+    reopened.close()
   })
 
   it('токен, зашифрованный другим ключом, считается отсутствующим, но не удаляется', () => {

@@ -1,20 +1,37 @@
 import { setTimeout as sleep } from 'timers/promises'
 
-import { ButtonInteraction, GuildTextBasedChannel, PermissionFlagsBits, User, VoiceBasedChannel } from 'discord.js'
+import {
+  ButtonInteraction,
+  GuildTextBasedChannel,
+  MessageFlags,
+  PermissionFlagsBits,
+  User,
+  VoiceBasedChannel
+} from 'discord.js'
 
 import { DatabaseService } from './database.service.js'
 import { stoppedEmbed, WAVE_BUTTON_PREFIX, WaveAction, WaveSession } from './wave-session.js'
+import { sameChoice, sanitizeChoice, settingsPanel } from './wave-settings.js'
 import { YandexMusicService } from './yandex-music.service.js'
 import { YandexAuthError } from '../errors/yandexAuthError.js'
+import { WaveChoice, WaveSettingGroup } from '../types/waveSettings.js'
 import { UserFacingError } from '../utils/errors.js'
-import { LONG_NOTICE_TTL, notify, SHORT_NOTICE_TTL } from '../utils/interactions.js'
+import { dismiss, LONG_NOTICE_TTL, notify, SHORT_NOTICE_TTL } from '../utils/interactions.js'
 import { logger } from '../utils/logger.js'
 import { isBotAdmin } from '../utils/permissions.js'
 
-const STATION_ID = 'user:onyourwave'
 const SHUTDOWN_TIMEOUT = 5_000
 
-const WAVE_ACTIONS: readonly string[] = ['like', 'previous', 'pause', 'resume', 'stop', 'next'] satisfies WaveAction[]
+const WAVE_ACTIONS: readonly string[] = [
+  'like',
+  'previous',
+  'pause',
+  'resume',
+  'stop',
+  'next',
+  'settings',
+  'reset'
+] satisfies WaveAction[]
 // Кнопки сообщений, отправленных до перехода на префикс wave:
 const LEGACY_BUTTON_IDS = new Set(['like', 'previous', 'pause', 'play', 'stop', 'next'])
 
@@ -24,6 +41,7 @@ export interface StartWaveOptions {
   textChannel: GuildTextBasedChannel
   yandexId: string
   accessToken: string
+  choice: WaveChoice
 }
 
 export class PlayerService {
@@ -67,7 +85,7 @@ export class PlayerService {
         voiceChannel,
         textChannel: options.textChannel,
         owner: { discordId: user.id, yandexId: options.yandexId, accessToken: options.accessToken },
-        stationId: STATION_ID,
+        choice: options.choice,
         onDestroy: destroyed => {
           if (this.sessions.get(destroyed.guildId) === destroyed) {
             this.sessions.delete(destroyed.guildId)
@@ -128,6 +146,62 @@ export class PlayerService {
       logger.error(`Ошибка при обработке кнопки ${customId}`, error)
       await notify(interaction, 'Произошла ошибка при управлении плеером.', LONG_NOTICE_TTL)
     }
+  }
+
+  /**
+   * «Применить» на панели настроек, открытой кнопкой ⚙️: волна перестраивается сразу, панель закрывается
+   */
+  public async applyWaveSettings(
+    interaction: ButtonInteraction,
+    playerMessageId: string,
+    choice: WaveChoice
+  ): Promise<void> {
+    const session = interaction.guildId ? this.sessions.get(interaction.guildId) : undefined
+    if (!session || session.messageId !== playerMessageId) {
+      await interaction.update({
+        content: 'Этот плеер больше не активен. Запустите волну командой `/my-wave`.',
+        components: []
+      })
+      return
+    }
+
+    const denied = this.checkAccess(session, interaction, 'settings')
+    if (denied) {
+      await interaction.update({ content: denied })
+      return
+    }
+
+    await interaction.deferUpdate()
+    if (!(await this.retuneWave(session, interaction.user, choice))) {
+      const stopReason = session.stopReason
+      await interaction.editReply(
+        stopReason
+          ? { content: stopReason, components: [] }
+          : { content: 'Не удалось применить настройки, волна играет с прежними. Попробуйте ещё раз.' }
+      )
+      return
+    }
+
+    await dismiss(interaction)
+  }
+
+  /**
+   * Смена настроек играющей волны. Если настройки те же, волна просто играет дальше, без новой сессии.
+   * Выбор слушателей не запоминается: при следующем запуске владелец увидит в панели собственные настройки
+   */
+  private async retuneWave(session: WaveSession, user: User, choice: WaveChoice): Promise<boolean> {
+    if (sameChoice(session.waveChoice, choice)) {
+      return true
+    }
+
+    if (!(await session.retune(choice))) {
+      return false
+    }
+
+    if (user.id === session.owner.discordId) {
+      DatabaseService.getInstance().saveWaveChoice(user.id, choice)
+    }
+    return true
   }
 
   /**
@@ -194,7 +268,46 @@ export class PlayerService {
       case 'next':
         await session.skip()
         return null
+      case 'settings':
+        return this.openWaveSettings(session, interaction)
+      case 'reset':
+        return this.resetWaveSettings(session, interaction)
     }
+  }
+
+  /**
+   * Сброс настроек из плеера: сразу играет «Моя волна» без настроек. Результат виден в плеере,
+   * поэтому сообщаем только о сбое
+   */
+  private async resetWaveSettings(session: WaveSession, interaction: ButtonInteraction): Promise<Notice | null> {
+    if (await this.retuneWave(session, interaction.user, {})) {
+      return null
+    }
+
+    // Если плеер остановился (например, истёк токен), причина уже показана в нём
+    return session.stopReason
+      ? null
+      : warning('Не удалось сбросить настройки, волна играет с прежними. Попробуйте ещё раз.')
+  }
+
+  /**
+   * Панель настроек для смены волны на ходу. Видна только нажавшему, варианты загружаются токеном владельца плеера
+   */
+  private async openWaveSettings(session: WaveSession, interaction: ButtonInteraction): Promise<Notice | null> {
+    let groups: WaveSettingGroup[]
+    try {
+      groups = await this.yandexMusicService.getWaveSettings(session.owner.accessToken)
+    } catch (error) {
+      logger.error('Не удалось загрузить настройки «Моей волны»', error)
+      return warning('Не удалось загрузить настройки «Моей волны». Попробуйте ещё раз.')
+    }
+
+    const panel = settingsPanel(groups, sanitizeChoice(session.waveChoice, groups), {
+      kind: 'retune',
+      playerMessageId: interaction.message.id
+    })
+    await interaction.followUp({ ...panel, flags: MessageFlags.Ephemeral })
+    return null
   }
 
   /**

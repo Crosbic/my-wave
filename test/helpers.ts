@@ -8,6 +8,7 @@ import { Collection, Message, MessageEditOptions, VoiceBasedChannel } from 'disc
 import { AudioPlayer, VoiceConnection, VoiceConnectionStatus } from '@discordjs/voice'
 
 import { WaveSession, WaveTimings } from '../src/services/wave-session.js'
+import { WaveChoice } from '../src/types/waveSettings.js'
 import { IYandexTrack } from '../src/types/yandexTrack.js'
 
 const TMP_ROOT = path.resolve('test/.tmp')
@@ -102,7 +103,7 @@ export interface TestSession {
   isDestroyed(): boolean
 }
 
-export function createTestSession(timings: Partial<WaveTimings> = FAST_TIMINGS): TestSession {
+export function createTestSession(timings: Partial<WaveTimings> = FAST_TIMINGS, choice: WaveChoice = {}): TestSession {
   const edits: MessageEditOptions[] = []
   const message = {
     id: 'message-1',
@@ -126,7 +127,7 @@ export function createTestSession(timings: Partial<WaveTimings> = FAST_TIMINGS):
       voiceChannel: { guild } as unknown as VoiceBasedChannel,
       textChannel: {} as never,
       owner: { discordId: 'owner', yandexId: 'yandex-owner', accessToken: 'token' },
-      stationId: 'user:onyourwave',
+      choice,
       onDestroy: () => (destroyed = true),
       timings
     },

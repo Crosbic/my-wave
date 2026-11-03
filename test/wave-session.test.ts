@@ -7,6 +7,7 @@ import {
   buttons,
   createTestSession,
   embedDescription,
+  FAST_TIMINGS,
   playerStatus,
   removeDir,
   tempDir,
@@ -16,7 +17,8 @@ import {
 } from './helpers.js'
 import { YandexAuthError } from '../src/errors/yandexAuthError.js'
 import { WaveSession } from '../src/services/wave-session.js'
-import { StationFeedback, YandexMusicService } from '../src/services/yandex-music.service.js'
+import { WaveFeedback, YandexMusicService } from '../src/services/yandex-music.service.js'
+import { WaveChoice } from '../src/types/waveSettings.js'
 import { IStationBatch } from '../src/types/yandexTrack.js'
 
 const yandex = YandexMusicService.getInstance()
@@ -35,23 +37,32 @@ before(() => {
 after(() => removeDir(dir))
 
 interface StubOptions {
-  batches?: IStationBatch[]
+  // Партии по порядку: и при создании сессии волны, и при запросе следующей. null — Яндекс Музыка завершила сессию
+  batches?: (IStationBatch | null)[]
   clip?: 'short' | 'long'
   brokenTracks?: string[]
   urlDelay?: number
-  stationTracks?: () => Promise<IStationBatch>
+  nextBatch?: () => Promise<IStationBatch | null>
   streamUrl?: (trackId: string) => string | null
 }
 
 function stubYandex(t: TestContext, options: StubOptions = {}) {
-  const feedback: StationFeedback[] = []
-  const queues: (string | undefined)[] = []
+  const feedback: { sessionId: string; item: WaveFeedback }[] = []
+  // Созданные сессии волны: сиды и queue каждой. Сессия с номером n получает идентификатор sn
+  const sessions: { seeds: string[]; queue: string[] }[] = []
+  const queues: string[][] = []
   const urlRequests: string[] = []
   const batches = [...(options.batches ?? [])]
+  const empty: IStationBatch = { batchId: 'empty', tracks: [] }
+  const nextBatch = options.nextBatch ?? (async () => (batches.length > 0 ? batches.shift()! : empty))
 
-  t.mock.method(yandex, 'getStationTracks', async (_token: string, _station: string, queue?: string) => {
+  t.mock.method(yandex, 'createWaveSession', async (_token: string, seeds: string[], queue: string[] = []) => {
+    sessions.push({ seeds, queue })
+    return { sessionId: `s${sessions.length}`, ...((await nextBatch()) ?? empty) }
+  })
+  t.mock.method(yandex, 'getWaveTracks', async (_token: string, _sessionId: string, queue: string[]) => {
     queues.push(queue)
-    return options.stationTracks ? options.stationTracks() : (batches.shift() ?? { batchId: 'empty', tracks: [] })
+    return nextBatch()
   })
   t.mock.method(yandex, 'getStreamUrl', async (_token: string, trackId: string) => {
     urlRequests.push(trackId)
@@ -66,17 +77,18 @@ function stubYandex(t: TestContext, options: StubOptions = {}) {
     }
     return options.clip === 'long' ? longClip : shortClip
   })
-  t.mock.method(yandex, 'sendStationFeedback', async (_token: string, _station: string, item: StationFeedback) => {
-    feedback.push(item)
+  t.mock.method(yandex, 'sendWaveFeedback', async (_token: string, sessionId: string, item: WaveFeedback) => {
+    feedback.push({ sessionId, item })
     return true
   })
 
-  const started = (id: string) => feedback.filter(f => f.type === 'trackStarted' && f.trackId === `${id}:100`).length
-  return { feedback, queues, urlRequests, started }
+  const started = (id: string) =>
+    feedback.filter(({ item }) => item.type === 'trackStarted' && item.trackId === `${id}:100`).length
+  return { feedback, sessions, queues, urlRequests, started }
 }
 
-function startedSession(t: TestContext) {
-  const test = createTestSession()
+function startedSession(t: TestContext, choice: WaveChoice = {}) {
+  const test = createTestSession(FAST_TIMINGS, choice)
   t.after(() => test.session.destroy('Конец теста'))
   return test
 }
@@ -85,30 +97,45 @@ async function waitForStart(session: WaveSession, started: (id: string) => numbe
   await waitFor(() => session.currentTrack?.id === id && started(id) === 1, `трек ${id} начал играть`)
 }
 
-function describeFeedback(feedback: StationFeedback[]): string[] {
-  return feedback.map(item => ('trackId' in item ? `${item.type} ${item.trackId}` : item.type))
+/**
+ * Фидбэк в виде «сессия событие трек», например «s1 trackStarted 11:100»
+ */
+function describeFeedback(feedback: { sessionId: string; item: WaveFeedback }[]): string[] {
+  return feedback.map(({ sessionId, item }) =>
+    'trackId' in item ? `${sessionId} ${item.type} ${item.trackId}` : `${sessionId} ${item.type}`
+  )
 }
 
 const batch = (batchId: string, ...ids: string[]): IStationBatch => ({ batchId, tracks: ids.map(id => track(id)) })
 
+const ACTIVE: WaveChoice = { moodEnergy: { seed: 'settingMoodEnergy:active', name: 'Бодрое' } }
+const WORKOUT_ACTIVE: WaveChoice = {
+  activity: { seed: 'activity:workout', name: 'Тренируюсь' },
+  moodEnergy: { seed: 'settingMoodEnergy:active', name: 'Бодрое' }
+}
+
 describe('WaveSession', () => {
-  it('играет волну по порядку и отправляет станции фидбэк', async t => {
+  it('играет волну по порядку и отправляет фидбэк в сессию волны', async t => {
     const yandexStub = stubYandex(t, { batches: [batch('b1', '11', '12')] })
     const { session } = startedSession(t)
 
     assert.equal(await session.start(), true)
     assert.equal(session.currentTrack?.id, '11')
-    assert.deepEqual(yandexStub.queues, [undefined], 'первая партия запрашивается без queue')
+    assert.deepEqual(
+      yandexStub.sessions,
+      [{ seeds: ['user:onyourwave'], queue: [] }],
+      'первая волна создаётся без queue'
+    )
 
     await waitForStart(session, yandexStub.started, '12')
 
     assert.deepEqual(describeFeedback(yandexStub.feedback), [
-      'radioStarted',
-      'trackStarted 11:100',
-      'trackFinished 11:100',
-      'trackStarted 12:100'
+      's1 radioStarted',
+      's1 trackStarted 11:100',
+      's1 trackFinished 11:100',
+      's1 trackStarted 12:100'
     ])
-    const finished = yandexStub.feedback.find(item => item.type === 'trackFinished')
+    const finished = yandexStub.feedback.find(({ item }) => item.type === 'trackFinished')?.item
     assert.equal(finished && 'batchId' in finished ? finished.batchId : null, 'b1')
   })
 
@@ -131,11 +158,11 @@ describe('WaveSession', () => {
 
     assert.equal(session.currentTrack?.id, '12')
     assert.ok(
-      yandexStub.feedback.some(item => item.type === 'skip' && item.trackId === '11:100' && item.batchId === 'b1')
+      yandexStub.feedback.some(({ item }) => item.type === 'skip' && item.trackId === '11:100' && item.batchId === 'b1')
     )
   })
 
-  it('следующая партия запрашивается с queue последнего трека', async t => {
+  it('следующая партия запрашивается у той же сессии с queue последних треков', async t => {
     const yandexStub = stubYandex(t, { batches: [batch('b1', '11', '12'), batch('b2', '21', '22')], clip: 'long' })
     const { session } = startedSession(t)
 
@@ -146,7 +173,111 @@ describe('WaveSession', () => {
     await session.skip()
 
     assert.equal(session.currentTrack?.id, '21')
-    assert.deepEqual(yandexStub.queues, [undefined, '12:100'])
+    assert.equal(yandexStub.sessions.length, 1)
+    assert.deepEqual(yandexStub.queues, [['11:100', '12:100']])
+  })
+
+  it('если Яндекс Музыка завершила сессию, создаётся новая с теми же настройками', async t => {
+    const yandexStub = stubYandex(t, { batches: [batch('b1', '11'), null, batch('b2', '21')], clip: 'long' })
+    const { session } = startedSession(t, ACTIVE)
+
+    await session.start()
+    await waitForStart(session, yandexStub.started, '11')
+    await session.skip()
+    await waitForStart(session, yandexStub.started, '21')
+
+    assert.deepEqual(yandexStub.sessions, [
+      { seeds: ['user:onyourwave', 'settingMoodEnergy:active'], queue: [] },
+      { seeds: ['user:onyourwave', 'settingMoodEnergy:active'], queue: ['11:100'] }
+    ])
+    assert.deepEqual(describeFeedback(yandexStub.feedback), [
+      's1 radioStarted',
+      's1 trackStarted 11:100',
+      's1 skip 11:100',
+      's2 radioStarted',
+      's2 trackStarted 21:100'
+    ])
+  })
+
+  it('смена настроек сразу включает первый трек новой волны', async t => {
+    const yandexStub = stubYandex(t, { batches: [batch('b1', '11', '12'), batch('b2', '21', '22')], clip: 'long' })
+    const { session, edits } = startedSession(t)
+
+    await session.start()
+    await waitForStart(session, yandexStub.started, '11')
+
+    assert.equal(await session.retune(WORKOUT_ACTIVE), true)
+    assert.equal(session.currentTrack?.id, '21', 'не ждём конца текущего трека')
+    assert.deepEqual(session.waveChoice, WORKOUT_ACTIVE)
+    assert.deepEqual(yandexStub.sessions[1], {
+      seeds: ['activity:workout', 'settingMoodEnergy:active'],
+      queue: ['11:100']
+    })
+
+    await waitForStart(session, yandexStub.started, '21')
+    // Прерванный трек засчитывается прежней волне как пропуск, как в клиенте Яндекс Музыки
+    assert.deepEqual(describeFeedback(yandexStub.feedback), [
+      's1 radioStarted',
+      's1 trackStarted 11:100',
+      's2 radioStarted',
+      's1 skip 11:100',
+      's2 trackStarted 21:100'
+    ])
+    await waitFor(
+      () => embedDescription(edits.at(-1))?.endsWith('\nВолна: Тренируюсь · Бодрое') ?? false,
+      'плеер показал настройки волны'
+    )
+
+    // Дальше играет новая волна, а ⏮️ по-прежнему возвращает прерванный трек
+    await session.skip()
+    assert.equal(session.currentTrack?.id, '22')
+    assert.equal(await session.previous(), 'ok')
+    assert.equal(await session.previous(), 'ok')
+    assert.equal(session.currentTrack?.id, '11')
+  })
+
+  it('кнопка сброса настроек есть, только пока у волны есть настройки', async t => {
+    const yandexStub = stubYandex(t, { batches: [batch('b1', '11', '12'), batch('b2', '21', '22')], clip: 'long' })
+    const { session, edits } = startedSession(t, ACTIVE)
+
+    await session.start()
+    await waitForStart(session, yandexStub.started, '11')
+    await waitFor(() => buttons(edits.at(-1)).like, 'плеер показал трек')
+    assert.equal(buttons(edits.at(-1)).reset, true)
+
+    assert.equal(await session.retune({}), true)
+    assert.deepEqual(yandexStub.sessions[1].seeds, ['user:onyourwave'])
+    await waitFor(
+      () => buttons(edits.at(-1)).like && !('reset' in buttons(edits.at(-1))),
+      'кнопка сброса пропала вместе с настройками'
+    )
+    assert.ok(!embedDescription(edits.at(-1))?.includes('Волна:'))
+  })
+
+  it('если новую волну получить не удалось, играет прежняя', async t => {
+    let calls = 0
+    const yandexStub = stubYandex(t, {
+      clip: 'long',
+      nextBatch: async () => {
+        if (++calls === 1) {
+          return batch('b1', '11', '12')
+        }
+        throw new Error('ECONNRESET')
+      }
+    })
+    const { session } = startedSession(t)
+
+    await session.start()
+    await waitForStart(session, yandexStub.started, '11')
+
+    assert.equal(await session.retune(ACTIVE), false)
+    assert.equal(session.currentTrack?.id, '11')
+    assert.equal(playerStatus(session), 'playing')
+    assert.deepEqual(session.waveChoice, {})
+    assert.ok(!yandexStub.feedback.some(({ item }) => item.type === 'skip'))
+
+    await session.skip()
+    assert.equal(session.currentTrack?.id, '12', 'очередь прежней волны не тронута')
   })
 
   it('⏮️ возвращает предыдущие треки, а ⏭️ ведёт обратно без дублей', async t => {
@@ -185,7 +316,7 @@ describe('WaveSession', () => {
     await waitFor(() => session.currentTrack?.id === '12', 'переход к следующему треку')
 
     assert.equal(yandexStub.urlRequests.filter(id => id === '11').length, 3)
-    assert.ok(!yandexStub.feedback.some(item => 'trackId' in item && item.trackId === '11:100'))
+    assert.ok(!yandexStub.feedback.some(({ item }) => 'trackId' in item && item.trackId === '11:100'))
   })
 
   it('кнопки ⏮️, 👍 и ⏸️ выключены, пока ими нельзя воспользоваться', async t => {
@@ -195,7 +326,14 @@ describe('WaveSession', () => {
     await session.start()
     await waitForStart(session, yandexStub.started, '11')
     await waitFor(() => buttons(edits.at(-1)).like, 'плеер показал трек')
-    assert.deepEqual(buttons(edits.at(-1)), { like: true, previous: false, pause: true, stop: true, next: true })
+    assert.deepEqual(buttons(edits.at(-1)), {
+      like: true,
+      previous: false,
+      pause: true,
+      stop: true,
+      next: true,
+      settings: true
+    })
 
     t.mock.method(yandex, 'getStreamUrl', async () => {
       await sleep(400)
@@ -203,7 +341,14 @@ describe('WaveSession', () => {
     })
     const skipping = session.skip()
     await sleep(150)
-    assert.deepEqual(buttons(edits.at(-1)), { like: false, previous: true, pause: false, stop: true, next: true })
+    assert.deepEqual(buttons(edits.at(-1)), {
+      like: false,
+      previous: true,
+      pause: false,
+      stop: true,
+      next: true,
+      settings: true
+    })
     await skipping
     await waitFor(() => buttons(edits.at(-1)).like, 'плеер показал следующий трек')
     assert.equal(buttons(edits.at(-1)).previous, true)
@@ -224,7 +369,7 @@ describe('WaveSession', () => {
 
   it('недействительный токен останавливает плеер с понятной причиной', async t => {
     stubYandex(t, {
-      stationTracks: async () => {
+      nextBatch: async () => {
         throw new YandexAuthError()
       }
     })
@@ -239,7 +384,7 @@ describe('WaveSession', () => {
   it('после пяти недоступных треков подряд плеер останавливается', async t => {
     let id = 0
     const yandexStub = stubYandex(t, {
-      stationTracks: async () => batch('b', String(++id), String(++id)),
+      nextBatch: async () => batch('b', String(++id), String(++id)),
       streamUrl: () => null
     })
     const { session } = startedSession(t)
@@ -249,16 +394,16 @@ describe('WaveSession', () => {
     assert.match(session.stopReason ?? '', /несколько треков подряд/)
   })
 
-  it('если API станции недоступен, после трёх попыток плеер останавливается', async t => {
+  it('если API волны недоступен, после трёх попыток плеер останавливается', async t => {
     const yandexStub = stubYandex(t, {
-      stationTracks: async () => {
+      nextBatch: async () => {
         throw new Error('ECONNRESET')
       }
     })
     const { session } = startedSession(t)
 
     assert.equal(await session.start(), false)
-    assert.equal(yandexStub.queues.length, 3)
+    assert.equal(yandexStub.sessions.length, 3)
     assert.match(session.stopReason ?? '', /Не удалось загрузить треки/)
   })
 

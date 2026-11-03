@@ -8,9 +8,16 @@ export interface IYandexTrack {
 }
 
 /**
- * Партия треков, выданная станцией. batchId нужен для фидбэка по этим трекам
+ * Партия треков, выданная волной. batchId нужен для фидбэка по этим трекам
  */
 export interface IStationBatch {
   batchId: string | null
   tracks: IYandexTrack[]
+}
+
+/**
+ * Сессия волны в Яндекс Музыке и её первая партия треков
+ */
+export interface IWaveSession extends IStationBatch {
+  sessionId: string
 }
