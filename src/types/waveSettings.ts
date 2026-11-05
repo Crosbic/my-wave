@@ -22,6 +22,17 @@ export interface WaveSettingGroup {
 }
 
 /**
- * Выбранные настройки волны. Группа без значения означает «Любое»
+ * Подборка из карусели «Моей волны», например «Хочется электроники»: своя волна со своими сидами.
+ * description — подпись подборки в карусели («Моя волна по жанру»)
  */
-export type WaveChoice = Partial<Record<WaveSettingKey, WaveOption>>
+export interface CarouselWave {
+  seeds: string[]
+  name: string
+  description?: string
+}
+
+/**
+ * Выбранные настройки волны. Группа без значения означает «Любое».
+ * wave — подборка из карусели: она играет вместо «Моей волны», а занятие заменяет её
+ */
+export type WaveChoice = Partial<Record<WaveSettingKey, WaveOption>> & { wave?: CarouselWave }

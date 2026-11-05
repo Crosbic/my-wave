@@ -3,20 +3,37 @@ import { setTimeout as sleep } from 'timers/promises'
 import {
   ButtonInteraction,
   GuildTextBasedChannel,
+  MessageComponentInteraction,
   MessageFlags,
   PermissionFlagsBits,
+  StringSelectMenuInteraction,
   User,
   VoiceBasedChannel
 } from 'discord.js'
 
 import { DatabaseService } from './database.service.js'
 import { stoppedEmbed, WAVE_BUTTON_PREFIX, WaveAction, WaveSession } from './wave-session.js'
-import { sameChoice, sanitizeChoice, settingsPanel } from './wave-settings.js'
+import {
+  carouselPanel,
+  isReshuffle,
+  isWaveSettingKey,
+  optionByValue,
+  parsePanelId,
+  readCarouselWave,
+  readSettingsPanel,
+  rememberedChoice,
+  sameChoice,
+  sanitizeChoice,
+  settingsPanel,
+  waveSeeds,
+  withCarousel,
+  withOption
+} from './wave-settings.js'
 import { YandexMusicService } from './yandex-music.service.js'
 import { YandexAuthError } from '../errors/yandexAuthError.js'
-import { WaveChoice, WaveSettingGroup } from '../types/waveSettings.js'
+import { CarouselWave, WaveChoice, WaveSettingGroup } from '../types/waveSettings.js'
 import { UserFacingError } from '../utils/errors.js'
-import { dismiss, LONG_NOTICE_TTL, notify, SHORT_NOTICE_TTL } from '../utils/interactions.js'
+import { dismiss, LONG_NOTICE_TTL, notify, respond, SHORT_NOTICE_TTL } from '../utils/interactions.js'
 import { logger } from '../utils/logger.js'
 import { isBotAdmin } from '../utils/permissions.js'
 
@@ -30,6 +47,7 @@ const WAVE_ACTIONS: readonly string[] = [
   'stop',
   'next',
   'settings',
+  'carousel',
   'reset'
 ] satisfies WaveAction[]
 // Кнопки сообщений, отправленных до перехода на префикс wave:
@@ -149,12 +167,98 @@ export class PlayerService {
   }
 
   /**
-   * «Применить» на панели настроек, открытой кнопкой ⚙️: волна перестраивается сразу, панель закрывается
+   * Нажатия на панелях под плеером: списки и кнопки панели ⚙️ и список «🎡 Подборки»
+   */
+  public async handleSettingsPanel(interaction: MessageComponentInteraction): Promise<void> {
+    const parsed = parsePanelId(interaction.customId)
+    if (!parsed || !(interaction.isButton() || interaction.isStringSelectMenu())) {
+      return
+    }
+
+    const { playerMessageId, field } = parsed
+    try {
+      if (interaction.isStringSelectMenu()) {
+        const [value] = interaction.values
+        if (field === 'carousel') {
+          // Выбранная подборка сразу заиграет
+          const wave = readCarouselWave(interaction.message.components, value)
+          if (wave) {
+            await this.playCarouselWave(interaction, playerMessageId, wave)
+          }
+        } else if (isWaveSettingKey(field)) {
+          // Выбор в списке только меняет панель: волна перестроится по «Применить»
+          const { groups, choice } = readSettingsPanel(interaction.message.components)
+          const option = optionByValue(
+            groups.find(group => group.key === field),
+            value
+          )
+          await interaction.update(settingsPanel(groups, withOption(choice, field, option), playerMessageId))
+        }
+      } else if (field === 'reset') {
+        const { groups } = readSettingsPanel(interaction.message.components)
+        await interaction.update(settingsPanel(groups, {}, playerMessageId))
+      } else if (field === 'submit' || field === 'default') {
+        // «Применить» оставляет играющую подборку, а «По умолчанию» возвращает обычную «Мою волну»
+        const { choice } = readSettingsPanel(interaction.message.components)
+        await this.applyWaveSettings(interaction, playerMessageId, field === 'default' ? {} : choice, {
+          keepCarousel: field === 'submit'
+        })
+      }
+    } catch (error) {
+      logger.error(`Ошибка на панели настроек волны (${interaction.customId})`, error)
+      await respond(interaction, 'Произошла ошибка, попробуйте ещё раз.')
+    }
+  }
+
+  /**
+   * «Применить» и «По умолчанию» на панели настроек, открытой кнопкой ⚙️: волна перестраивается сразу,
+   * панель закрывается. keepCarousel — оставить играющую подборку, если в панели не выбрано занятие
    */
   public async applyWaveSettings(
     interaction: ButtonInteraction,
     playerMessageId: string,
-    choice: WaveChoice
+    choice: WaveChoice,
+    { keepCarousel }: { keepCarousel: boolean }
+  ): Promise<void> {
+    await this.changeWave(interaction, playerMessageId, {
+      action: 'settings',
+      choice: current => (keepCarousel ? withCarousel(choice, current) : choice),
+      remember: true,
+      failure: 'Не удалось применить настройки, волна играет с прежними. Попробуйте ещё раз.'
+    })
+  }
+
+  /**
+   * Выбор в списке «🎡 Подборки»: подборка сразу заиграет. Настройки сбрасываются, как при нажатии на плитку
+   * в приложении. Подборка запоминается как настройка, кроме «Встряхнуть Мою волну»: это разовое действие,
+   * и запомненные настройки после него остаются прежними
+   */
+  public async playCarouselWave(
+    interaction: StringSelectMenuInteraction,
+    playerMessageId: string,
+    wave: CarouselWave
+  ): Promise<void> {
+    await this.changeWave(interaction, playerMessageId, {
+      action: 'carousel',
+      choice: () => ({ wave }),
+      remember: !isReshuffle(wave),
+      failure: 'Не удалось включить подборку, волна играет с прежними настройками. Попробуйте ещё раз.'
+    })
+  }
+
+  /**
+   * Смена волны из панели под плеером. Если плеер уже другой или прав нет, панель объясняет почему,
+   * а после успешной смены закрывается
+   */
+  private async changeWave(
+    interaction: ButtonInteraction | StringSelectMenuInteraction,
+    playerMessageId: string,
+    options: {
+      action: WaveAction
+      choice: (current: WaveChoice) => WaveChoice
+      remember: boolean
+      failure: string
+    }
   ): Promise<void> {
     const session = interaction.guildId ? this.sessions.get(interaction.guildId) : undefined
     if (!session || session.messageId !== playerMessageId) {
@@ -165,20 +269,17 @@ export class PlayerService {
       return
     }
 
-    const denied = this.checkAccess(session, interaction, 'settings')
+    const denied = this.checkAccess(session, interaction, options.action)
     if (denied) {
       await interaction.update({ content: denied })
       return
     }
 
     await interaction.deferUpdate()
-    if (!(await this.retuneWave(session, interaction.user, choice))) {
+    const choice = options.choice(session.waveChoice)
+    if (!(await this.retuneWave(session, interaction.user, choice, options.remember))) {
       const stopReason = session.stopReason
-      await interaction.editReply(
-        stopReason
-          ? { content: stopReason, components: [] }
-          : { content: 'Не удалось применить настройки, волна играет с прежними. Попробуйте ещё раз.' }
-      )
+      await interaction.editReply(stopReason ? { content: stopReason, components: [] } : { content: options.failure })
       return
     }
 
@@ -187,9 +288,10 @@ export class PlayerService {
 
   /**
    * Смена настроек играющей волны. Если настройки те же, волна просто играет дальше, без новой сессии.
-   * Выбор слушателей не запоминается: при следующем запуске владелец увидит в панели собственные настройки
+   * Настройки вместе с подборкой запоминаются за тем, кто их поменял, даже в чужом плеере: с ними запустится
+   * его следующий /my-wave, а запомненные настройки владельца плеера не меняются
    */
-  private async retuneWave(session: WaveSession, user: User, choice: WaveChoice): Promise<boolean> {
+  private async retuneWave(session: WaveSession, user: User, choice: WaveChoice, remember = true): Promise<boolean> {
     if (sameChoice(session.waveChoice, choice)) {
       return true
     }
@@ -198,8 +300,8 @@ export class PlayerService {
       return false
     }
 
-    if (user.id === session.owner.discordId) {
-      DatabaseService.getInstance().saveWaveChoice(user.id, choice)
+    if (remember) {
+      DatabaseService.getInstance().saveWaveChoice(user.id, rememberedChoice(choice))
     }
     return true
   }
@@ -218,7 +320,11 @@ export class PlayerService {
   /**
    * Проверка прав на управление плеером. Возвращает текст отказа или null, если действие разрешено
    */
-  private checkAccess(session: WaveSession, interaction: ButtonInteraction, action: WaveAction): string | null {
+  private checkAccess(
+    session: WaveSession,
+    interaction: MessageComponentInteraction,
+    action: WaveAction
+  ): string | null {
     // Лайк ставится в аккаунт нажавшего, поэтому доступен всем
     if (action === 'like') {
       return null
@@ -270,9 +376,32 @@ export class PlayerService {
         return null
       case 'settings':
         return this.openWaveSettings(session, interaction)
+      case 'carousel':
+        return this.openCarousel(session, interaction)
       case 'reset':
         return this.resetWaveSettings(session, interaction)
     }
+  }
+
+  /**
+   * Подборки карусели под играющую волну. Видны только нажавшему, загружаются токеном владельца плеера
+   */
+  private async openCarousel(session: WaveSession, interaction: ButtonInteraction): Promise<Notice | null> {
+    let waves: CarouselWave[]
+    try {
+      waves = await this.yandexMusicService.getWaveCarousel(session.owner.accessToken, waveSeeds(session.waveChoice))
+    } catch (error) {
+      logger.error('Не удалось загрузить подборки «Моей волны»', error)
+      return warning('Не удалось загрузить подборки. Попробуйте ещё раз.')
+    }
+
+    const panel = carouselPanel(waves, session.waveChoice, interaction.message.id)
+    if (!panel) {
+      return warning('Яндекс Музыка не предложила подборок. Попробуйте позже.')
+    }
+
+    await interaction.followUp({ ...panel, flags: MessageFlags.Ephemeral })
+    return null
   }
 
   /**
@@ -302,10 +431,7 @@ export class PlayerService {
       return warning('Не удалось загрузить настройки «Моей волны». Попробуйте ещё раз.')
     }
 
-    const panel = settingsPanel(groups, sanitizeChoice(session.waveChoice, groups), {
-      kind: 'retune',
-      playerMessageId: interaction.message.id
-    })
+    const panel = settingsPanel(groups, sanitizeChoice(session.waveChoice, groups), interaction.message.id)
     await interaction.followUp({ ...panel, flags: MessageFlags.Ephemeral })
     return null
   }

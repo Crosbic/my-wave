@@ -205,6 +205,46 @@ describe('YandexMusicService', () => {
     ])
   })
 
+  it('карусель запрашивается с играющей волной и оставляет только подборки-волны', async () => {
+    // Плитки в том виде, в каком их отдаёт Яндекс Музыка (сокращённо)
+    const items = [
+      {
+        id: 'genre:electronics',
+        type: 'WAVE',
+        data: { wave: { name: 'Хочется электроники', description: 'Моя волна по жанру', seeds: ['genre:electronics'] } }
+      },
+      { id: 'unboxing_promo', type: 'PROMO_LINK', data: { title: 'Промо' } },
+      { id: 'setting', type: 'SETTING', data: { title: 'Настроить' } },
+      { id: '44585000', type: 'ALBUM', data: { album: {} } },
+      {
+        id: 'diversity:reshuffle',
+        type: 'WAVE',
+        data: { wave: { name: 'Встряхнуть Мою волну', seeds: ['diversity:reshuffle_1793627542457'] } }
+      },
+      { id: 'broken', type: 'WAVE', data: { wave: { name: 'Без сидов', seeds: [] } } }
+    ]
+    let wrapped = true
+    const { client, requests } = createClient(() =>
+      wrapped ? { result: { wheelId: 'wheel-1', items } } : { wheelId: 'wheel-1', items }
+    )
+
+    const waves = await client.getWaveCarousel('token', ['user:onyourwave', 'settingLanguage:russian'])
+
+    assert.equal(requests[0].url, '/wheel/new')
+    assert.deepEqual(requests[0].body, {
+      context: { type: 'WAVE', data: { seeds: ['user:onyourwave', 'settingLanguage:russian'] } },
+      feedbacks: []
+    })
+    assert.deepEqual(waves, [
+      { name: 'Хочется электроники', description: 'Моя волна по жанру', seeds: ['genre:electronics'] },
+      { name: 'Встряхнуть Мою волну', seeds: ['diversity:reshuffle_1793627542457'] }
+    ])
+
+    wrapped = false
+    assert.equal((await client.getWaveCarousel('token')).length, 2, 'ответ без обёртки result тоже понятен')
+    assert.deepEqual((requests[1].body as { context: unknown }).context, { type: 'EMPTY' })
+  })
+
   it('выбирает полный mp3 с максимальным битрейтом и подписывает ссылку', async () => {
     const { client, requests } = createClient(request => {
       if (request.url.endsWith('/download-info')) {
@@ -248,6 +288,7 @@ describe('YandexMusicService', () => {
     await assert.rejects(client.createWaveSession('token', ['user:onyourwave']), YandexAuthError)
     await assert.rejects(client.getWaveTracks('token', 'session-1', []), YandexAuthError)
     await assert.rejects(client.getWaveSettings('token'), YandexAuthError)
+    await assert.rejects(client.getWaveCarousel('token'), YandexAuthError)
     await assert.rejects(client.getStreamUrl('token', '1'), YandexAuthError)
     await assert.rejects(client.likeTrack('token', 'uid', '1'), YandexAuthError)
     assert.equal(await client.sendWaveFeedback('token', 'session-1', { type: 'radioStarted' }), false)

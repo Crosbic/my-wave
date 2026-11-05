@@ -1,15 +1,15 @@
 import assert from 'node:assert/strict'
 import { beforeEach, describe, it, TestContext } from 'node:test'
 
-import { ButtonInteraction, Collection, MessageFlags } from 'discord.js'
+import { ButtonInteraction, Collection, MessageFlags, StringSelectMenuInteraction } from 'discord.js'
 
 import { track } from './helpers.js'
 import { YandexAuthError } from '../src/errors/yandexAuthError.js'
 import { DatabaseService } from '../src/services/database.service.js'
 import { PlayerService } from '../src/services/player.service.js'
-import { describeChoice, readSettingsPanel, SettingsPanel } from '../src/services/wave-settings.js'
+import { describeChoice, readCarouselWave, readSettingsPanel, SettingsPanel } from '../src/services/wave-settings.js'
 import { YandexMusicService } from '../src/services/yandex-music.service.js'
-import { WaveChoice, WaveSettingGroup } from '../src/types/waveSettings.js'
+import { CarouselWave, WaveChoice, WaveSettingGroup } from '../src/types/waveSettings.js'
 import { LONG_NOTICE_TTL, SHORT_NOTICE_TTL } from '../src/utils/interactions.js'
 
 const GROUPS: WaveSettingGroup[] = [
@@ -25,6 +25,11 @@ const GROUPS: WaveSettingGroup[] = [
 ]
 const ACTIVE: WaveChoice = { moodEnergy: { seed: 'settingMoodEnergy:active', name: 'Бодрое' } }
 const CALM: WaveChoice = { moodEnergy: { seed: 'settingMoodEnergy:calm', name: 'Спокойное' } }
+const ELECTRONICS: CarouselWave = { seeds: ['genre:electronics'], name: 'Хочется электроники' }
+const NO_WORDS: CarouselWave = {
+  seeds: ['genre:electronics', 'local-language:instrumental'],
+  name: 'Электроника без слов'
+}
 
 /**
  * Сессия без звука: проверяем только, как PlayerService реагирует на кнопки
@@ -113,12 +118,26 @@ function press(customId: string, options: PressOptions = {}) {
   return { calls, replies, done }
 }
 
-function apply(choice: WaveChoice, options: PressOptions & { playerMessageId?: string } = {}) {
+function apply(choice: WaveChoice, options: PressOptions & { playerMessageId?: string; keepCarousel?: boolean } = {}) {
   const { interaction, calls } = buttonInteraction('wave-settings:message-1:submit', options)
   const done = PlayerService.getInstance().applyWaveSettings(
     interaction,
     options.playerMessageId ?? 'message-1',
-    choice
+    choice,
+    { keepCarousel: options.keepCarousel ?? true }
+  )
+  return { calls, done }
+}
+
+/**
+ * Выбор подборки в списке «🎡 Подборки»
+ */
+function pick(wave: CarouselWave, options: PressOptions = {}) {
+  const { interaction, calls } = buttonInteraction('wave-settings:message-1:carousel', options)
+  const done = PlayerService.getInstance().playCarouselWave(
+    interaction as unknown as StringSelectMenuInteraction,
+    'message-1',
+    wave
   )
   return { calls, done }
 }
@@ -356,15 +375,19 @@ describe('PlayerService: настройки волны', () => {
     assert.deepEqual(savedChoices, [])
   })
 
-  it('выбор слушателя с публичным доступом меняет волну, но не запоминается за владельца', async t => {
+  it('выбор слушателя с публичным доступом запоминается за самим слушателем, а не за владельцем', async t => {
     stubDatabase(t)
     publicAccess = true
 
-    const { done } = apply(CALM, { user: 'listener' })
-    await done
-
+    const applied = apply(CALM, { user: 'listener' })
+    await applied.done
     assert.deepEqual(session.calls, ['retune: Спокойное'])
-    assert.deepEqual(savedChoices, [])
+    assert.deepEqual(savedChoices, [['listener', CALM]])
+
+    const reset = press('wave:reset', { user: 'listener' })
+    await reset.done
+    assert.deepEqual(savedChoices.at(-1), ['listener', {}], 'сброс тоже запоминается за нажавшим')
+    assert.ok(!savedChoices.some(([id]) => id === 'owner'), 'настройки владельца не тронуты')
   })
 
   it('без доступа, со старой панелью или при сбое волна не меняется, а панель объясняет почему', async t => {
@@ -390,5 +413,95 @@ describe('PlayerService: настройки волны', () => {
 
     assert.deepEqual(session.calls, ['retune: Спокойное'], 'перестроить волну пытались только в последнем случае')
     assert.deepEqual(savedChoices, [])
+  })
+})
+
+describe('PlayerService: подборки карусели', () => {
+  it('🎡 открывает подборки под играющую волну, видимые только нажавшему', async t => {
+    stubDatabase(t)
+    const carousel = t.mock.method(YandexMusicService.getInstance(), 'getWaveCarousel', async () => [ELECTRONICS])
+
+    const { calls, replies, done } = press('wave:carousel')
+    await done
+
+    assert.deepEqual(
+      carousel.mock.calls[0].arguments,
+      ['token', ['user:onyourwave', 'settingMoodEnergy:active']],
+      'карусель запрашивается токеном владельца с сидами играющей волны'
+    )
+    assert.equal(calls[1], 'followUp: Выберите подборку, и она сразу заиграет.')
+    assert.equal(replies[0].flags, MessageFlags.Ephemeral)
+    assert.deepEqual(readCarouselWave(replies[0].components, 'genre:electronics'), ELECTRONICS)
+  })
+
+  it('без подборок или при сбое карусели нажавший видит предупреждение', async t => {
+    stubDatabase(t)
+    let waves: CarouselWave[] | null = []
+    t.mock.method(YandexMusicService.getInstance(), 'getWaveCarousel', async () => {
+      if (!waves) {
+        throw new Error('ECONNRESET')
+      }
+      return waves
+    })
+
+    const empty = press('wave:carousel')
+    await empty.done
+    assert.equal(empty.calls[1], 'followUp: Яндекс Музыка не предложила подборок. Попробуйте позже.')
+
+    waves = null
+    const failed = press('wave:carousel')
+    await failed.done
+    assert.equal(failed.calls[1], 'followUp: Не удалось загрузить подборки. Попробуйте ещё раз.')
+  })
+
+  it('выбранная подборка сразу играет без настроек и запоминается за выбравшим', async t => {
+    stubDatabase(t)
+    publicAccess = true
+
+    const { calls, done } = pick(ELECTRONICS)
+    await done
+
+    assert.deepEqual(session.calls, ['retune: Хочется электроники'])
+    assert.deepEqual(savedChoices, [['owner', { wave: ELECTRONICS }]])
+    assert.deepEqual(calls, ['deferUpdate', 'deleteReply: @original'])
+
+    const listener = pick(NO_WORDS, { user: 'listener' })
+    await listener.done
+    assert.deepEqual(savedChoices.at(-1), ['listener', { wave: NO_WORDS }])
+  })
+
+  it('«Встряхнуть Мою волну» играет, но не запоминается: это разовое действие', async t => {
+    stubDatabase(t)
+
+    const { done } = pick({ seeds: ['diversity:reshuffle_1793627542457'], name: 'Встряхнуть Мою волну' })
+    await done
+
+    assert.deepEqual(session.calls, ['retune: Встряхнуть Мою волну'])
+    assert.deepEqual(savedChoices, [], 'запомненные настройки остаются прежними')
+  })
+
+  it('выбор играющей подборки просто закрывает список', async t => {
+    stubDatabase(t)
+    session.waveChoice = { wave: ELECTRONICS }
+
+    const { calls, done } = pick({ seeds: ['genre:electronics'], name: 'Хочется электроники' })
+    await done
+
+    assert.deepEqual(session.calls, [])
+    assert.deepEqual(calls, ['deferUpdate', 'deleteReply: @original'])
+  })
+
+  it('настройки из ⚙️ ложатся поверх подборки и запоминаются вместе с ней, а «По умолчанию» её убирает', async t => {
+    stubDatabase(t)
+    session.waveChoice = { wave: ELECTRONICS }
+
+    const applied = apply(CALM)
+    await applied.done
+    assert.deepEqual(session.calls, ['retune: Хочется электроники · Спокойное'])
+    assert.deepEqual(savedChoices, [['owner', { ...CALM, wave: ELECTRONICS }]])
+
+    const reset = apply({}, { keepCarousel: false })
+    await reset.done
+    assert.deepEqual(session.calls.at(-1), 'retune: ')
   })
 })

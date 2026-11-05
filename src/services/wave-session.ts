@@ -83,7 +83,7 @@ const COLOR_STOPPED = '#FF0000'
 const FOOTER = 'Яндекс Музыка'
 
 export const WAVE_BUTTON_PREFIX = 'wave:'
-export type WaveAction = 'like' | 'previous' | 'pause' | 'resume' | 'stop' | 'next' | 'settings' | 'reset'
+export type WaveAction = 'like' | 'previous' | 'pause' | 'resume' | 'stop' | 'next' | 'settings' | 'carousel' | 'reset'
 
 type EndReason = 'finished' | 'skip' | 'error'
 
@@ -815,7 +815,7 @@ interface ControlsState {
   paused: boolean
   hasTrack: boolean
   hasPrevious: boolean
-  // Волна играет не с «Любое» во всех группах: тогда настройки можно сбросить
+  // Играет подборка или не «Любое» в какой-то группе: тогда настройки можно сбросить
   hasSettings: boolean
 }
 
@@ -830,7 +830,10 @@ function controlsRows({
   hasPrevious,
   hasSettings
 }: ControlsState): ActionRowBuilder<ButtonBuilder>[] {
-  const waveRow = new ActionRowBuilder<ButtonBuilder>().addComponents(controlButton('settings', '⚙️ Настроить волну'))
+  const waveRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    controlButton('settings', '⚙️ Настроить волну'),
+    controlButton('carousel', '🎡 Подборки')
+  )
   if (hasSettings) {
     waveRow.addComponents(controlButton('reset', '↩️ Сбросить настройки'))
   }

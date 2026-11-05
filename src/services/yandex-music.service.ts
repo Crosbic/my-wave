@@ -5,7 +5,7 @@ import axios, { AxiosInstance, InternalAxiosRequestConfig, isAxiosError } from '
 
 import { YandexAuthError } from '../errors/yandexAuthError.js'
 import { IUserData } from '../types/userData.js'
-import { WaveSettingGroup, WaveSettingKey } from '../types/waveSettings.js'
+import { CarouselWave, WaveSettingGroup, WaveSettingKey } from '../types/waveSettings.js'
 import { IStationBatch, IWaveSession, IYandexTrack } from '../types/yandexTrack.js'
 import { logger } from '../utils/logger.js'
 
@@ -89,6 +89,17 @@ interface ApiWaveSettings {
   settingRestrictions?: Partial<
     Record<Exclude<WaveSettingKey, 'activity'>, { name: string; possibleValues?: ApiWaveValue[] }>
   >
+}
+
+// Карусель подборок: context — играющая волна, feedbacks — отклики о показах и нажатиях (бот их не шлёт)
+interface WheelBody {
+  context: { type: 'EMPTY' } | { type: 'WAVE'; data: { seeds: string[] } }
+  feedbacks: unknown[]
+}
+
+interface ApiWheel {
+  wheelId?: string
+  items?: { type?: string; data?: { wave?: { name?: string; description?: string; seeds?: string[] } } }[]
 }
 
 // Ответы, которых нет в спецификации
@@ -188,6 +199,35 @@ export class YandexMusicService {
         headers: this.authHeaders(token)
       })
       return this.toWaveSettingGroups(response.data.result)
+    } catch (error) {
+      throw this.wrapError(error)
+    }
+  }
+
+  /**
+   * Подборки из карусели «Моей волны». seeds — играющая волна: Яндекс Музыка подбирает подборки под неё.
+   * Промо, плитка настроек и альбомы отбрасываются
+   */
+  public async getWaveCarousel(token: string, seeds: string[] = []): Promise<CarouselWave[]> {
+    const body: WheelBody = {
+      context: seeds.length > 0 ? { type: 'WAVE', data: { seeds } } : { type: 'EMPTY' },
+      feedbacks: []
+    }
+
+    try {
+      const response = await this.http.post<ApiWheel & { result?: ApiWheel }>('/wheel/new', body, {
+        headers: this.authHeaders(token)
+      })
+      // Метода нет ни в одной спецификации, а веб-клиент получает ответ без обёртки result: понимаем оба вида
+      const wheel = response.data.result ?? response.data
+
+      return (wheel.items ?? []).flatMap(item => {
+        const wave = item.data?.wave
+        if (item.type !== 'WAVE' || !wave?.name || !wave.seeds?.length) {
+          return []
+        }
+        return [{ name: wave.name, seeds: wave.seeds, ...(wave.description && { description: wave.description }) }]
+      })
     } catch (error) {
       throw this.wrapError(error)
     }

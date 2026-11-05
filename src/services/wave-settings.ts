@@ -8,29 +8,27 @@ import {
   StringSelectMenuBuilder
 } from 'discord.js'
 
-import { WaveChoice, WaveOption, WaveSettingGroup, WaveSettingKey } from '../types/waveSettings.js'
+import { CarouselWave, WaveChoice, WaveOption, WaveSettingGroup, WaveSettingKey } from '../types/waveSettings.js'
 
 export const MY_WAVE_SEED = 'user:onyourwave'
+// Сид плитки «Встряхнуть Мою волну» в карусели, к нему добавляется отметка времени: diversity:reshuffle_<мс>
+const RESHUFFLE_SEED = 'diversity:reshuffle'
 
 // Порядок групп в панели и в описании волны
 export const WAVE_SETTING_KEYS: readonly WaveSettingKey[] = ['activity', 'diversity', 'moodEnergy', 'language']
 
 export const WAVE_SETTINGS_PREFIX = 'wave-settings:'
 
-// Панель перед запуском волны; у панели ⚙️ вместо этого стоит ID сообщения плеера
-const LAUNCH_TARGET = 'new'
 // Значение «Любое» в выпадающем списке: сиды всегда содержат двоеточие, поэтому не совпадут с ним
 const ANY_VALUE = 'any'
 // В сообщении не больше пяти рядов компонентов: четыре списка и ряд кнопок
 const MAX_GROUPS = 4
 const MAX_SELECT_OPTIONS = 25
+// Ограничение Discord на длину значения, названия и подписи пункта списка
+const MAX_OPTION_LENGTH = 100
 
-/**
- * Для какой волны открыта панель: новой (перед запуском) или уже играющей (кнопка ⚙️ в плеере)
- */
-export type PanelTarget = { kind: 'launch' } | { kind: 'retune'; playerMessageId: string }
-
-export type PanelField = WaveSettingKey | 'submit' | 'default' | 'reset'
+// carousel — список подборок из кнопки «🎡 Подборки» в плеере
+export type PanelField = WaveSettingKey | 'submit' | 'default' | 'reset' | 'carousel'
 
 export interface SettingsPanel {
   content: string
@@ -38,33 +36,47 @@ export interface SettingsPanel {
 }
 
 /**
- * Сиды сессии волны, как их собирает веб-клиент Яндекс Музыки: занятие заменяет «Мою волну»,
- * а характер, настроение и язык добавляются к ней. «Любое» сидом не передаётся
+ * Сиды сессии волны, как их собирает веб-клиент Яндекс Музыки: занятие или подборка карусели заменяют
+ * «Мою волну», а характер, настроение и язык добавляются к ним. «Любое» сидом не передаётся
  */
 export function waveSeeds(choice: WaveChoice): string[] {
+  const base = choice.activity ? [choice.activity.seed] : (choice.wave?.seeds ?? [MY_WAVE_SEED])
   const settings = WAVE_SETTING_KEYS.filter(key => key !== 'activity').flatMap(key => choice[key]?.seed ?? [])
-  return [choice.activity?.seed ?? MY_WAVE_SEED, ...settings]
+  return [...base, ...settings]
 }
 
 /**
- * Все группы «Любое»: обычная «Моя волна» без настроек
+ * Все группы «Любое» и нет подборки: обычная «Моя волна» без настроек
  */
 export function isDefaultChoice(choice: WaveChoice): boolean {
-  return WAVE_SETTING_KEYS.every(key => !choice[key])
+  return !choice.wave && WAVE_SETTING_KEYS.every(key => !choice[key])
 }
 
 /**
  * Одинаковые ли настройки. Сравниваются сиды: название значения могло поменяться в Яндекс Музыке
  */
 export function sameChoice(a: WaveChoice, b: WaveChoice): boolean {
-  return WAVE_SETTING_KEYS.every(key => a[key]?.seed === b[key]?.seed)
+  return (
+    a.wave?.seeds.join(',') === b.wave?.seeds.join(',') && WAVE_SETTING_KEYS.every(key => a[key]?.seed === b[key]?.seed)
+  )
 }
 
 /**
- * Краткое описание настроек для плеера, например «Тренируюсь · Бодрое». Пустая строка, если всё «Любое»
+ * Краткое описание настроек для плеера, например «Хочется электроники · Бодрое». Пустая строка, если всё «Любое»
  */
 export function describeChoice(choice: WaveChoice): string {
-  return WAVE_SETTING_KEYS.flatMap(key => choice[key]?.name ?? []).join(' · ')
+  return [
+    ...(choice.wave ? [choice.wave.name] : []),
+    ...WAVE_SETTING_KEYS.flatMap(key => choice[key]?.name ?? [])
+  ].join(' · ')
+}
+
+/**
+ * Настройки из панели ⚙️ поверх играющей подборки карусели, как в приложении: характер, настроение и язык
+ * добавляются к подборке, а выбранное занятие её заменяет
+ */
+export function withCarousel(choice: WaveChoice, current: WaveChoice): WaveChoice {
+  return current.wave && !choice.activity && !choice.wave ? { ...choice, wave: current.wave } : choice
 }
 
 /**
@@ -101,13 +113,35 @@ export function parseWaveChoice(value: unknown): WaveChoice {
     return choice
   }
 
+  const record = value as Record<string, unknown>
   for (const key of WAVE_SETTING_KEYS) {
-    const option: unknown = (value as Record<string, unknown>)[key]
+    const option = record[key]
     if (isWaveOption(option)) {
       choice = withOption(choice, key, { seed: option.seed, name: option.name })
     }
   }
+  if (isCarouselWave(record.wave)) {
+    choice.wave = { seeds: [...record.wave.seeds], name: record.wave.name }
+  }
   return choice
+}
+
+/**
+ * «Встряхнуть Мою волну» из карусели: разовое действие с отметкой времени в сиде, а не настройка волны
+ */
+export function isReshuffle(wave: CarouselWave | undefined): boolean {
+  return wave?.seeds.some(seed => seed.startsWith(RESHUFFLE_SEED)) ?? false
+}
+
+/**
+ * Что из выбора запомнить для следующего /my-wave: всё, кроме «Встряхнуть Мою волну»
+ */
+export function rememberedChoice(choice: WaveChoice): WaveChoice {
+  if (!isReshuffle(choice.wave)) {
+    return choice
+  }
+  const { wave: _wave, ...settings } = choice
+  return settings
 }
 
 export function isWaveSettingKey(value: string): value is WaveSettingKey {
@@ -115,19 +149,15 @@ export function isWaveSettingKey(value: string): value is WaveSettingKey {
 }
 
 /**
- * Панель настроек: по выпадающему списку на группу и кнопки. Состояние панели хранится в самом сообщении
- * (выбранные пункты списков), поэтому между нажатиями боту ничего не нужно помнить
+ * Панель настроек играющей волны (кнопка ⚙️ в плеере): по выпадающему списку на группу и кнопки.
+ * Состояние панели хранится в самом сообщении (выбранные пункты списков), поэтому между нажатиями
+ * боту ничего не нужно помнить
  */
-export function settingsPanel(
-  groups: WaveSettingGroup[],
-  choice: WaveChoice,
-  target: PanelTarget,
-  notice?: string
-): SettingsPanel {
+export function settingsPanel(groups: WaveSettingGroup[], choice: WaveChoice, playerMessageId: string): SettingsPanel {
   const rows = groups.slice(0, MAX_GROUPS).map(group =>
     new ActionRowBuilder<MessageActionRowComponentBuilder>().addComponents(
       new StringSelectMenuBuilder()
-        .setCustomId(panelId(target, group.key))
+        .setCustomId(panelId(playerMessageId, group.key))
         .setPlaceholder(group.name)
         .addOptions(
           { label: group.anyName, value: ANY_VALUE },
@@ -141,27 +171,25 @@ export function settingsPanel(
     )
   )
 
-  const launch = target.kind === 'launch'
   rows.push(
     new ActionRowBuilder<MessageActionRowComponentBuilder>().addComponents(
       new ButtonBuilder()
-        .setCustomId(panelId(target, 'submit'))
-        .setLabel(launch ? '▶️ Запустить' : 'Применить')
+        .setCustomId(panelId(playerMessageId, 'submit'))
+        .setLabel('Применить')
         .setStyle(ButtonStyle.Primary),
       // Волна без настроек одним нажатием, не выбирая «Любое» в каждом списке
       new ButtonBuilder()
-        .setCustomId(panelId(target, 'default'))
-        .setLabel(launch ? '▶️ По умолчанию' : 'По умолчанию')
+        .setCustomId(panelId(playerMessageId, 'default'))
+        .setLabel('По умолчанию')
         .setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId(panelId(target, 'reset')).setLabel('Сбросить').setStyle(ButtonStyle.Secondary)
+      new ButtonBuilder()
+        .setCustomId(panelId(playerMessageId, 'reset'))
+        .setLabel('Сбросить')
+        .setStyle(ButtonStyle.Secondary)
     )
   )
 
-  const hint =
-    target.kind === 'launch'
-      ? 'Выберите настройки «Моей волны» и нажмите «Запустить».'
-      : 'Новые настройки применятся сразу: заиграет первый трек новой волны.'
-  return { content: notice ?? hint, components: rows }
+  return { content: 'Новые настройки применятся сразу: заиграет первый трек новой волны.', components: rows }
 }
 
 /**
@@ -200,26 +228,79 @@ export function readSettingsPanel(components: readonly { toJSON(): unknown }[]):
 }
 
 /**
- * Разбор customId компонента панели: wave-settings:<new или ID сообщения плеера>:<поле>
+ * Список подборок для кнопки «🎡 Подборки». Выбор в нём сразу включает подборку, поэтому кнопок нет.
+ * null — показывать нечего
  */
-export function parsePanelId(customId: string | undefined): { target: PanelTarget; field: PanelField } | null {
-  if (!customId?.startsWith(WAVE_SETTINGS_PREFIX)) {
-    return null
-  }
+export function carouselPanel(
+  waves: CarouselWave[],
+  current: WaveChoice,
+  playerMessageId: string
+): SettingsPanel | null {
+  const playing = current.wave?.seeds.join(',')
+  const options = waves
+    .map(wave => ({ wave, value: wave.seeds.join(',') }))
+    .filter(({ value }) => value.length <= MAX_OPTION_LENGTH)
+    .slice(0, MAX_SELECT_OPTIONS)
+    .map(({ wave, value }) => ({
+      label: wave.name.slice(0, MAX_OPTION_LENGTH),
+      value,
+      ...(wave.description && { description: wave.description.slice(0, MAX_OPTION_LENGTH) }),
+      default: value === playing
+    }))
 
-  const [target, field] = customId.slice(WAVE_SETTINGS_PREFIX.length).split(':')
-  if (
-    !target ||
-    !field ||
-    !(isWaveSettingKey(field) || field === 'submit' || field === 'default' || field === 'reset')
-  ) {
+  if (options.length === 0) {
     return null
   }
 
   return {
-    target: target === LAUNCH_TARGET ? { kind: 'launch' } : { kind: 'retune', playerMessageId: target },
-    field
+    content: 'Выберите подборку, и она сразу заиграет.',
+    components: [
+      new ActionRowBuilder<MessageActionRowComponentBuilder>().addComponents(
+        new StringSelectMenuBuilder()
+          .setCustomId(panelId(playerMessageId, 'carousel'))
+          .setPlaceholder('Подборки для вас')
+          .addOptions(options)
+      )
+    ]
   }
+}
+
+/**
+ * Подборка, выбранная в списке «🎡 Подборки»: сиды хранятся в значении пункта, название — в его подписи
+ */
+export function readCarouselWave(
+  components: readonly { toJSON(): unknown }[],
+  value: string
+): CarouselWave | undefined {
+  for (const row of components.map(component => component.toJSON() as ComponentJson)) {
+    for (const component of row.components ?? []) {
+      const option = component.options?.find(item => item.value === value)
+      if (option && parsePanelId(component.custom_id)?.field === 'carousel') {
+        return { seeds: value.split(','), name: option.label }
+      }
+    }
+  }
+  return undefined
+}
+
+/**
+ * Разбор customId компонента панели: wave-settings:<ID сообщения плеера>:<поле>
+ */
+export function parsePanelId(customId: string | undefined): { playerMessageId: string; field: PanelField } | null {
+  if (!customId?.startsWith(WAVE_SETTINGS_PREFIX)) {
+    return null
+  }
+
+  const [playerMessageId, field] = customId.slice(WAVE_SETTINGS_PREFIX.length).split(':')
+  if (
+    !playerMessageId ||
+    !field ||
+    !(isWaveSettingKey(field) || field === 'submit' || field === 'default' || field === 'reset' || field === 'carousel')
+  ) {
+    return null
+  }
+
+  return { playerMessageId, field }
 }
 
 /**
@@ -229,14 +310,23 @@ export function optionByValue(group: WaveSettingGroup | undefined, value: string
   return value === ANY_VALUE ? undefined : group?.options.find(option => option.seed === value)
 }
 
-function panelId(target: PanelTarget, field: PanelField): string {
-  const id = target.kind === 'launch' ? LAUNCH_TARGET : target.playerMessageId
-  return `${WAVE_SETTINGS_PREFIX}${id}:${field}`
+function panelId(playerMessageId: string, field: PanelField): string {
+  return `${WAVE_SETTINGS_PREFIX}${playerMessageId}:${field}`
 }
 
 function isWaveOption(value: unknown): value is WaveOption {
   const option = value as Partial<WaveOption> | null
   return typeof option?.seed === 'string' && typeof option.name === 'string'
+}
+
+function isCarouselWave(value: unknown): value is CarouselWave {
+  const wave = value as Partial<CarouselWave> | null
+  return (
+    typeof wave?.name === 'string' &&
+    Array.isArray(wave.seeds) &&
+    wave.seeds.length > 0 &&
+    wave.seeds.every(seed => typeof seed === 'string')
+  )
 }
 
 interface ComponentJson {

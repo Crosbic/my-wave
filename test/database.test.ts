@@ -172,12 +172,19 @@ describe('DatabaseService', () => {
       language: { seed: 'settingLanguage:russian', name: 'Русский' }
     }
 
+    const withWave = {
+      moodEnergy: { seed: 'settingMoodEnergy:active', name: 'Бодрое' },
+      wave: { seeds: ['genre:electronics', 'local-language:instrumental'], name: 'Электроника без слов' }
+    }
+
     const db = DatabaseService.open(dir)
     assert.deepEqual(db.getWaveChoice('user'), {}, 'без сохранённого выбора всё «Любое»')
     db.saveWaveChoice('user', choice)
     assert.deepEqual(db.getWaveChoice('user'), choice)
     db.saveWaveChoice('other', {})
     assert.deepEqual(db.getWaveChoice('other'), {})
+    db.saveWaveChoice('carousel', withWave)
+    assert.deepEqual(db.getWaveChoice('carousel'), withWave, 'подборка запоминается вместе с настройками')
     db.close()
 
     const raw = new Database(path.join(dir, 'data.db'))
@@ -188,7 +195,8 @@ describe('DatabaseService', () => {
       JSON.stringify({
         moodEnergy: { seed: 'settingMoodEnergy:fun', name: 'Весёлое' },
         language: { seed: 1 },
-        unknown: { seed: 'x', name: 'y' }
+        unknown: { seed: 'x', name: 'y' },
+        wave: { seeds: [], name: 'Без сидов' }
       })
     )
     raw.close()

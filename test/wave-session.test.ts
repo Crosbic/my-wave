@@ -254,6 +254,23 @@ describe('WaveSession', () => {
     assert.ok(!embedDescription(edits.at(-1))?.includes('Волна:'))
   })
 
+  it('подборка карусели играет со своими сидами, а плеер показывает её название', async t => {
+    const yandexStub = stubYandex(t, { batches: [batch('b1', '11', '12'), batch('b2', '21', '22')], clip: 'long' })
+    const { session, edits } = startedSession(t)
+
+    await session.start()
+    await waitForStart(session, yandexStub.started, '11')
+
+    const wave = { seeds: ['genre:electronics', 'local-language:instrumental'], name: 'Электроника без слов' }
+    assert.equal(await session.retune({ wave }), true)
+    assert.deepEqual(yandexStub.sessions[1].seeds, ['genre:electronics', 'local-language:instrumental'])
+    await waitFor(
+      () => embedDescription(edits.at(-1))?.endsWith('\nВолна: Электроника без слов') ?? false,
+      'плеер показал подборку'
+    )
+    assert.equal(buttons(edits.at(-1)).reset, true, 'с подборки можно вернуться к обычной «Моей волне»')
+  })
+
   it('если новую волну получить не удалось, играет прежняя', async t => {
     let calls = 0
     const yandexStub = stubYandex(t, {
@@ -332,7 +349,8 @@ describe('WaveSession', () => {
       pause: true,
       stop: true,
       next: true,
-      settings: true
+      settings: true,
+      carousel: true
     })
 
     t.mock.method(yandex, 'getStreamUrl', async () => {
@@ -347,7 +365,8 @@ describe('WaveSession', () => {
       pause: false,
       stop: true,
       next: true,
-      settings: true
+      settings: true,
+      carousel: true
     })
     await skipping
     await waitFor(() => buttons(edits.at(-1)).like, 'плеер показал следующий трек')

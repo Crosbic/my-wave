@@ -1,7 +1,6 @@
 import { Events, Interaction } from 'discord.js'
 
 import { commandsByName } from '../commands/index.js'
-import { handleSettingsPanel } from '../commands/my-wave.js'
 import { PlayerService } from '../services/player.service.js'
 import { WAVE_SETTINGS_PREFIX } from '../services/wave-settings.js'
 import { BotEvent } from '../types/event.js'
@@ -12,7 +11,7 @@ export const interactionCreate = {
   name: Events.InteractionCreate,
   async execute(interaction: Interaction) {
     if (interaction.isMessageComponent() && interaction.customId.startsWith(WAVE_SETTINGS_PREFIX)) {
-      await handleSettingsPanel(interaction)
+      await PlayerService.getInstance().handleSettingsPanel(interaction)
       return
     }
 
