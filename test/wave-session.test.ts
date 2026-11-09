@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
 import { after, before, describe, it, TestContext } from 'node:test'
 import path from 'path'
 import { setTimeout as sleep } from 'timers/promises'
@@ -41,9 +42,10 @@ interface StubOptions {
   batches?: (IStationBatch | null)[]
   clip?: 'short' | 'long'
   brokenTracks?: string[]
-  urlDelay?: number
+  streamDelay?: number
   nextBatch?: () => Promise<IStationBatch | null>
-  streamUrl?: (trackId: string) => string | null
+  // Файл, который «скачивается» для трека. null — загрузить файл не удалось
+  streamFile?: (trackId: string) => string | null
 }
 
 function stubYandex(t: TestContext, options: StubOptions = {}) {
@@ -51,7 +53,7 @@ function stubYandex(t: TestContext, options: StubOptions = {}) {
   // Созданные сессии волны: сиды и queue каждой. Сессия с номером n получает идентификатор sn
   const sessions: { seeds: string[]; queue: string[] }[] = []
   const queues: string[][] = []
-  const urlRequests: string[] = []
+  const streamRequests: string[] = []
   const batches = [...(options.batches ?? [])]
   const empty: IStationBatch = { batchId: 'empty', tracks: [] }
   const nextBatch = options.nextBatch ?? (async () => (batches.length > 0 ? batches.shift()! : empty))
@@ -64,18 +66,20 @@ function stubYandex(t: TestContext, options: StubOptions = {}) {
     queues.push(queue)
     return nextBatch()
   })
-  t.mock.method(yandex, 'getStreamUrl', async (_token: string, trackId: string) => {
-    urlRequests.push(trackId)
-    if (options.urlDelay) {
-      await sleep(options.urlDelay)
+  t.mock.method(yandex, 'openTrackStream', async (_token: string, trackId: string) => {
+    streamRequests.push(trackId)
+    if (options.streamDelay) {
+      await sleep(options.streamDelay)
     }
-    if (options.streamUrl) {
-      return options.streamUrl(trackId)
+
+    let file: string | null = options.clip === 'long' ? longClip : shortClip
+    if (options.streamFile) {
+      file = options.streamFile(trackId)
+    } else if (options.brokenTracks?.includes(trackId)) {
+      // Поток с ошибкой чтения, как оборванная загрузка
+      file = path.join(dir, 'missing.wav')
     }
-    if (options.brokenTracks?.includes(trackId)) {
-      return path.join(dir, 'missing.wav')
-    }
-    return options.clip === 'long' ? longClip : shortClip
+    return file === null ? null : fs.createReadStream(file)
   })
   t.mock.method(yandex, 'sendWaveFeedback', async (_token: string, sessionId: string, item: WaveFeedback) => {
     feedback.push({ sessionId, item })
@@ -84,7 +88,17 @@ function stubYandex(t: TestContext, options: StubOptions = {}) {
 
   const started = (id: string) =>
     feedback.filter(({ item }) => item.type === 'trackStarted' && item.trackId === `${id}:100`).length
-  return { feedback, sessions, queues, urlRequests, started }
+  return { feedback, sessions, queues, streamRequests, started }
+}
+
+/**
+ * Загрузка длинного клипа, которая отвечает с задержкой: успеваем увидеть плеер, пока трек загружается
+ */
+function slowLongClip(t: TestContext) {
+  t.mock.method(yandex, 'openTrackStream', async () => {
+    await sleep(400)
+    return fs.createReadStream(longClip)
+  })
 }
 
 function startedSession(t: TestContext, choice: WaveChoice = {}) {
@@ -146,10 +160,7 @@ describe('WaveSession', () => {
     await session.start()
     await waitForStart(session, yandexStub.started, '11')
 
-    t.mock.method(yandex, 'getStreamUrl', async () => {
-      await sleep(400)
-      return longClip
-    })
+    slowLongClip(t)
     const skipping = session.skip()
     await sleep(150)
     assert.equal(playerStatus(session), 'idle', 'текущий трек заглушён до загрузки следующего')
@@ -332,7 +343,7 @@ describe('WaveSession', () => {
     await session.start()
     await waitFor(() => session.currentTrack?.id === '12', 'переход к следующему треку')
 
-    assert.equal(yandexStub.urlRequests.filter(id => id === '11').length, 3)
+    assert.equal(yandexStub.streamRequests.filter(id => id === '11').length, 3)
     assert.ok(!yandexStub.feedback.some(({ item }) => 'trackId' in item && item.trackId === '11:100'))
   })
 
@@ -353,10 +364,7 @@ describe('WaveSession', () => {
       carousel: true
     })
 
-    t.mock.method(yandex, 'getStreamUrl', async () => {
-      await sleep(400)
-      return longClip
-    })
+    slowLongClip(t)
     const skipping = session.skip()
     await sleep(150)
     assert.deepEqual(buttons(edits.at(-1)), {
@@ -404,12 +412,12 @@ describe('WaveSession', () => {
     let id = 0
     const yandexStub = stubYandex(t, {
       nextBatch: async () => batch('b', String(++id), String(++id)),
-      streamUrl: () => null
+      streamFile: () => null
     })
     const { session } = startedSession(t)
 
     assert.equal(await session.start(), false)
-    assert.equal(yandexStub.urlRequests.length, 5)
+    assert.equal(yandexStub.streamRequests.length, 5)
     assert.match(session.stopReason ?? '', /несколько треков подряд/)
   })
 

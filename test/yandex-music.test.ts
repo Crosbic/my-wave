@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
+import http from 'node:http'
+import { AddressInfo } from 'node:net'
+import { Readable } from 'node:stream'
 import { describe, it } from 'node:test'
 
 import axios, { AxiosError, AxiosHeaders, AxiosInstance, InternalAxiosRequestConfig, isAxiosError } from 'axios'
@@ -35,6 +38,17 @@ function createClient(respond: (request: Request) => unknown) {
     }
   })
   return { client, requests }
+}
+
+async function readText(stream: Readable | null): Promise<string | null> {
+  if (!stream) {
+    return null
+  }
+  const chunks: Buffer[] = []
+  for await (const chunk of stream) {
+    chunks.push(Buffer.from(chunk))
+  }
+  return Buffer.concat(chunks).toString()
 }
 
 function unauthorized(): AxiosError {
@@ -269,6 +283,39 @@ describe('YandexMusicService', () => {
       .update('XGRlBW9FXlekgbPrRHuSiA' + 'path/to/file' + 'salt')
       .digest('hex')
     assert.equal(url, `https://host.example/get-mp3/${sign}/0001/path/to/file`)
+  })
+
+  it('аудиофайл скачивает сам бот и отдаёт поток, переадресации хранилища проходит, ошибку — нет', async t => {
+    const server = http.createServer((req, res) => {
+      if (req.url === '/track.mp3') {
+        res.writeHead(200, { 'content-type': 'audio/mpeg' })
+        res.end('mp3-bytes')
+      } else if (req.url === '/moved') {
+        res.writeHead(302, { location: '/track.mp3' })
+        res.end()
+      } else {
+        res.writeHead(403)
+        res.end()
+      }
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', () => resolve()))
+    t.after(() => {
+      server.closeAllConnections()
+      server.close()
+    })
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+
+    const { client } = createClient(() => ({}))
+    let url: string | null = `${base}/track.mp3`
+    t.mock.method(client, 'getStreamUrl', async () => url)
+
+    assert.equal(await readText(await client.openTrackStream('token', '1')), 'mp3-bytes')
+    url = `${base}/moved`
+    assert.equal(await readText(await client.openTrackStream('token', '1')), 'mp3-bytes', 'переадресация хранилища')
+    url = `${base}/forbidden`
+    assert.equal(await client.openTrackStream('token', '1'), null)
+    url = null
+    assert.equal(await client.openTrackStream('token', '1'), null, 'ссылку на файл получить не удалось')
   })
 
   it('лайк отправляет поле track-ids', async () => {

@@ -1,3 +1,4 @@
+import { Readable } from 'stream'
 import { setTimeout as sleep } from 'timers/promises'
 
 import {
@@ -445,12 +446,16 @@ export class WaveSession {
   }
 
   private async play(item: QueueItem, attempt = 1): Promise<boolean> {
-    const url = await this.yandex.getStreamUrl(this.owner.accessToken, item.track.id)
-    if (!url || this.destroyed) {
+    const stream = await this.yandex.openTrackStream(this.owner.accessToken, item.track.id)
+    if (!stream || this.destroyed) {
+      if (stream) {
+        discard(stream)
+      }
       return false
     }
 
-    const resource = createAudioResource(url, { inputType: StreamType.Arbitrary, inlineVolume: true })
+    // Плеер закрывает поток при смене трека и остановке, вместе с ним обрывается и загрузка файла
+    const resource = createAudioResource(stream, { inputType: StreamType.Arbitrary, inlineVolume: true })
     resource.volume?.setVolume(VOLUME)
 
     this.current = { item, resource, attempt }
@@ -869,4 +874,13 @@ function destroyConnection(connection: VoiceConnection): void {
   if (connection.state.status !== VoiceConnectionStatus.Destroyed) {
     connection.destroy()
   }
+}
+
+/**
+ * Закрытие ненужного потока трека. Недокачанный файл при закрытии сообщает об обрыве ошибкой,
+ * а ошибка без обработчика уронила бы процесс
+ */
+function discard(stream: Readable): void {
+  stream.on('error', () => {})
+  stream.destroy()
 }

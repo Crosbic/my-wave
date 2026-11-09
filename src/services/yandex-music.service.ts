@@ -1,7 +1,9 @@
 import crypto from 'crypto'
+import { Readable } from 'stream'
 import { setTimeout as sleep } from 'timers/promises'
 
 import axios, { AxiosInstance, InternalAxiosRequestConfig, isAxiosError } from 'axios'
+import { Agent, request } from 'undici'
 
 import { YandexAuthError } from '../errors/yandexAuthError.js'
 import { IUserData } from '../types/userData.js'
@@ -28,6 +30,10 @@ const ANY_VALUE_NAME = 'Любое'
 const RESTRICTION_KEYS = ['diversity', 'moodEnergy', 'language'] as const
 
 const log = logger.child('yandex')
+
+// Аудиофайл качается, пока трек играет, а на паузе загрузка стоит: ограничено только ожидание ответа, не тела
+const audioAgent = new Agent({ headersTimeout: REQUEST_TIMEOUT, bodyTimeout: 0 })
+const MAX_AUDIO_REDIRECTS = 5
 
 // Типы запросов и ответов сгенерированы из спецификации API (yarn api:generate):
 // опечатка в имени параметра или поля запроса не скомпилируется
@@ -305,6 +311,35 @@ export class YandexMusicService {
     } catch (error) {
       log.warn(`Не удалось отправить фидбэк ${feedback.type} сессии волны`, error)
       return false
+    }
+  }
+
+  /**
+   * Поток аудиофайла трека. Файл скачивает сам бот, а ffmpeg получает уже данные: статическая сборка ffmpeg
+   * из ffmpeg-static в Docker-образе на bookworm не может сама открыть ссылку, у неё не работает DNS.
+   * null — файл получить не удалось, причина в логе
+   */
+  public async openTrackStream(token: string, trackId: string): Promise<Readable | null> {
+    const url = await this.getStreamUrl(token, trackId)
+    if (!url) {
+      return null
+    }
+
+    try {
+      const { statusCode, body } = await request(url, {
+        dispatcher: audioAgent,
+        maxRedirections: MAX_AUDIO_REDIRECTS
+      })
+      if (statusCode !== 200) {
+        // Тело ошибки дочитываем: закрытый недокачанным поток undici сообщает об обрыве ошибкой
+        await body.dump()
+        log.warn(`Хранилище вернуло HTTP ${statusCode} для трека ${trackId}`)
+        return null
+      }
+      return body
+    } catch (error) {
+      log.error(`Не удалось начать загрузку трека ${trackId}`, error)
+      return null
     }
   }
 
