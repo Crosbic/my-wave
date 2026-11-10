@@ -10,7 +10,7 @@ import { removeDir, tempDir } from './helpers.js'
 import { DatabaseService } from '../src/services/database.service.js'
 import { encrypt, isEncrypted } from '../src/utils/crypto.js'
 
-const LATEST_SCHEMA_VERSION = 3
+const LATEST_SCHEMA_VERSION = 4
 const dirs: string[] = []
 
 after(() => dirs.forEach(removeDir))
@@ -79,7 +79,7 @@ describe('DatabaseService', () => {
     const db = DatabaseService.open(dir)
 
     assert.equal(db.schemaVersion, LATEST_SCHEMA_VERSION)
-    db.saveUserToken('user', 'plain-token', userInfo)
+    db.saveUserToken('user', { accessToken: 'plain-token' }, userInfo)
     assert.equal(db.getUserData('user')?.accessToken, 'plain-token')
     db.setPublicButtonsAccess('guild', true)
     assert.equal(db.getPublicButtonsAccess('guild'), true)
@@ -100,6 +100,7 @@ describe('DatabaseService', () => {
     assert.equal(db.schemaVersion, LATEST_SCHEMA_VERSION)
     assert.equal(db.getUserData('encrypted')?.accessToken, 'token-a')
     assert.equal(db.getUserData('plain')?.accessToken, 'token-b')
+    assert.equal(db.getUserData('plain')?.refreshToken, undefined, 'старые токены бот не продлевает')
     db.close()
 
     assert.ok(storedTokens(dir).every(isEncrypted))
@@ -210,10 +211,38 @@ describe('DatabaseService', () => {
     reopened.close()
   })
 
+  it('хранит refresh-токен зашифрованным, а вставленный вручную токен не наследует его от прежнего входа', () => {
+    const dir = newDir('db-refresh-token')
+    const expiresAt = Date.now() + 365 * 24 * 60 * 60 * 1000
+
+    const db = DatabaseService.open(dir)
+    db.saveUserToken('user', { accessToken: 'access', refreshToken: 'refresh', expiresAt }, userInfo)
+    assert.deepEqual(db.getUserData('user'), {
+      accessToken: 'access',
+      refreshToken: 'refresh',
+      expiresAt,
+      userInfo
+    })
+    db.close()
+
+    const raw = new Database(path.join(dir, 'data.db'), { readonly: true })
+    const row = raw.prepare('SELECT refresh_token FROM users').get() as { refresh_token: string }
+    raw.close()
+    assert.ok(isEncrypted(row.refresh_token))
+
+    const reopened = DatabaseService.open(dir)
+    reopened.saveUserToken('user', { accessToken: 'manual' }, userInfo)
+    const user = reopened.getUserData('user')
+    assert.equal(user?.accessToken, 'manual')
+    assert.equal(user?.refreshToken, undefined)
+    assert.equal(user?.expiresAt, undefined)
+    reopened.close()
+  })
+
   it('токен, зашифрованный другим ключом, считается отсутствующим, но не удаляется', () => {
     const dir = newDir('db-wrong-key')
     const db = DatabaseService.open(dir)
-    db.saveUserToken('user', 'token', userInfo)
+    db.saveUserToken('user', { accessToken: 'token' }, userInfo)
     db.close()
 
     // Тот же формат, что у utils/crypto, но с другим ключом

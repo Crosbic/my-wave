@@ -3,6 +3,7 @@ import { setTimeout as sleep } from 'timers/promises'
 import {
   ButtonInteraction,
   GuildTextBasedChannel,
+  InteractionUpdateOptions,
   MessageComponentInteraction,
   MessageFlags,
   PermissionFlagsBits,
@@ -15,6 +16,7 @@ import { DatabaseService } from './database.service.js'
 import { stoppedEmbed, WAVE_BUTTON_PREFIX, WaveAction, WaveSession } from './wave-session.js'
 import {
   carouselPanel,
+  historyPanel,
   isReshuffle,
   isWaveSettingKey,
   optionByValue,
@@ -25,6 +27,7 @@ import {
   sameChoice,
   sanitizeChoice,
   settingsPanel,
+  textPanel,
   waveSeeds,
   withCarousel,
   withOption
@@ -46,6 +49,7 @@ const WAVE_ACTIONS: readonly string[] = [
   'resume',
   'stop',
   'next',
+  'history',
   'settings',
   'carousel',
   'reset'
@@ -78,7 +82,8 @@ export class PlayerService {
   }
 
   /**
-   * Запуск «Моей волны» на сервере. Если плеер уже запущен этим же пользователем, он перезапускается
+   * Запуск «Моей волны» на сервере. Если плеер уже запущен этим же пользователем, он перезапускается.
+   * Если Яндекс отклонил токен, бросает YandexAuthError: тогда /my-wave предлагает войти заново
    */
   public async startWave(options: StartWaveOptions): Promise<void> {
     const { user, voiceChannel } = options
@@ -113,7 +118,9 @@ export class PlayerService {
       this.sessions.set(guildId, session)
 
       if (!(await session.start())) {
-        throw new UserFacingError(session.stopReason ?? 'Не удалось запустить «Мою волну».')
+        throw session.tokenRejected
+          ? new YandexAuthError()
+          : new UserFacingError(session.stopReason ?? 'Не удалось запустить «Мою волну».')
       }
     } finally {
       this.starting.delete(guildId)
@@ -126,6 +133,18 @@ export class PlayerService {
   public async stopSessionsOf(discordUserId: string, reason: string): Promise<void> {
     const owned = [...this.sessions.values()].filter(session => session.owner.discordId === discordUserId)
     await Promise.all(owned.map(session => session.destroy(reason)))
+  }
+
+  /**
+   * Новый токен после повторного входа. Прежний токен того же аккаунта Яндекса может перестать работать,
+   * поэтому плееры пользователя переходят на новый. Плееры, запущенные с другим аккаунтом, играют дальше со старым
+   */
+  public updateOwnerToken(discordUserId: string, yandexId: string, accessToken: string): void {
+    for (const session of this.sessions.values()) {
+      if (session.owner.discordId === discordUserId && session.owner.yandexId === yandexId) {
+        session.owner.accessToken = accessToken
+      }
+    }
   }
 
   /**
@@ -167,7 +186,7 @@ export class PlayerService {
   }
 
   /**
-   * Нажатия на панелях под плеером: списки и кнопки панели ⚙️ и список «🎡 Подборки»
+   * Нажатия на панелях под плеером: списки и кнопки панели ⚙️, список «🎡 Подборки» и кнопки «📜 Истории»
    */
   public async handleSettingsPanel(interaction: MessageComponentInteraction): Promise<void> {
     const parsed = parsePanelId(interaction.customId)
@@ -175,7 +194,7 @@ export class PlayerService {
       return
     }
 
-    const { playerMessageId, field } = parsed
+    const { playerMessageId, field, args } = parsed
     try {
       if (interaction.isStringSelectMenu()) {
         const [value] = interaction.values
@@ -203,6 +222,11 @@ export class PlayerService {
         await this.applyWaveSettings(interaction, playerMessageId, field === 'default' ? {} : choice, {
           keepCarousel: field === 'submit'
         })
+      } else if (field === 'history-play') {
+        const [page, trackId] = args
+        await this.playHistoryTrack(interaction, playerMessageId, Number(page), trackId)
+      } else if (field === 'history-page') {
+        await this.showHistoryPage(interaction, playerMessageId, Number(args[0]))
       }
     } catch (error) {
       logger.error(`Ошибка на панели настроек волны (${interaction.customId})`, error)
@@ -247,6 +271,46 @@ export class PlayerService {
   }
 
   /**
+   * Кнопка ▶️ в «📜 Истории»: трек сразу заиграет, а история закроется. Если трек не запустился или уже
+   * пропал из истории, та же страница показывается заново с пояснением
+   */
+  public async playHistoryTrack(
+    interaction: ButtonInteraction,
+    playerMessageId: string,
+    page: number,
+    trackId: string
+  ): Promise<void> {
+    const session = await this.panelSession(interaction, playerMessageId, 'history')
+    if (!session) {
+      return
+    }
+
+    await interaction.deferUpdate()
+    const result = await session.playFromHistory(trackId)
+    if (result === 'ok') {
+      await dismiss(interaction)
+    } else if (session.stopReason) {
+      await interaction.editReply(textPanel(session.stopReason))
+    } else {
+      const notice =
+        result === 'missing'
+          ? 'Этого трека уже нет в истории, список обновлён.'
+          : 'Не удалось включить трек, играет прежний. Попробуйте ещё раз.'
+      await interaction.editReply(historyPanel(session.recentTracks, playerMessageId, page, notice))
+    }
+  }
+
+  /**
+   * Листание «📜 Истории». Страница собирается заново, поэтому показывает историю на момент нажатия
+   */
+  public async showHistoryPage(interaction: ButtonInteraction, playerMessageId: string, page: number): Promise<void> {
+    const session = await this.panelSession(interaction, playerMessageId, 'history')
+    if (session) {
+      await interaction.update(historyPanel(session.recentTracks, playerMessageId, page))
+    }
+  }
+
+  /**
    * Смена волны из панели под плеером. Если плеер уже другой или прав нет, панель объясняет почему,
    * а после успешной смены закрывается
    */
@@ -260,18 +324,8 @@ export class PlayerService {
       failure: string
     }
   ): Promise<void> {
-    const session = interaction.guildId ? this.sessions.get(interaction.guildId) : undefined
-    if (!session || session.messageId !== playerMessageId) {
-      await interaction.update({
-        content: 'Этот плеер больше не активен. Запустите волну командой `/my-wave`.',
-        components: []
-      })
-      return
-    }
-
-    const denied = this.checkAccess(session, interaction, options.action)
-    if (denied) {
-      await interaction.update({ content: denied })
+    const session = await this.panelSession(interaction, playerMessageId, options.action)
+    if (!session) {
       return
     }
 
@@ -284,6 +338,34 @@ export class PlayerService {
     }
 
     await dismiss(interaction)
+  }
+
+  /**
+   * Плеер, которым управляет панель, если он ещё работает и нажавшему можно им управлять.
+   * Иначе панель объясняет, почему ничего не произошло, и возвращается null
+   */
+  private async panelSession(
+    interaction: ButtonInteraction | StringSelectMenuInteraction,
+    playerMessageId: string,
+    action: WaveAction
+  ): Promise<WaveSession | null> {
+    const session = interaction.guildId ? this.sessions.get(interaction.guildId) : undefined
+    if (!session || session.messageId !== playerMessageId) {
+      await interaction.update(
+        panelNotice(interaction, 'Этот плеер больше не активен. Запустите волну командой `/my-wave`.', {
+          close: true
+        })
+      )
+      return null
+    }
+
+    const denied = this.checkAccess(session, interaction, action)
+    if (denied) {
+      await interaction.update(panelNotice(interaction, denied, { close: false }))
+      return null
+    }
+
+    return session
   }
 
   /**
@@ -374,6 +456,8 @@ export class PlayerService {
       case 'next':
         await session.skip()
         return null
+      case 'history':
+        return this.openHistory(session, interaction)
       case 'settings':
         return this.openWaveSettings(session, interaction)
       case 'carousel':
@@ -381,6 +465,21 @@ export class PlayerService {
       case 'reset':
         return this.resetWaveSettings(session, interaction)
     }
+  }
+
+  /**
+   * Первая страница сыгранных треков. Видна только нажавшему, ▶️ у трека сразу его включает
+   */
+  private async openHistory(session: WaveSession, interaction: ButtonInteraction): Promise<Notice | null> {
+    const tracks = session.recentTracks
+    // Пустую историю показывает неактивная кнопка, поэтому без треков молча ничего не делаем
+    if (tracks.length > 0) {
+      await interaction.followUp({
+        ...historyPanel(tracks, interaction.message.id, 0),
+        flags: MessageFlags.Ephemeral | MessageFlags.IsComponentsV2
+      })
+    }
+    return null
   }
 
   /**
@@ -463,9 +562,7 @@ export class PlayerService {
         : warning(`Не удалось добавить трек «${track.title}» в «Мне нравится».`)
     } catch (error) {
       if (error instanceof YandexAuthError) {
-        return warning(
-          'Ваш токен Яндекса недействителен или истёк. Получите новый через `/login-help` и выполните `/login`.'
-        )
+        return warning('Ваш токен Яндекса недействителен или истёк. Войдите заново командой `/login`.')
       }
       throw error
     }
@@ -484,6 +581,21 @@ function confirmation(content: string): Notice {
 
 function warning(content: string): Notice {
   return { content, ttl: LONG_NOTICE_TTL }
+}
+
+/**
+ * Текст на месте панели. «📜 История» собрана из компонентов V2: там текст заменяет её целиком.
+ * У остальных панелей close решает, убрать ли списки и кнопки под текстом
+ */
+function panelNotice(
+  interaction: MessageComponentInteraction,
+  content: string,
+  { close }: { close: boolean }
+): InteractionUpdateOptions {
+  if (interaction.message.flags.has(MessageFlags.IsComponentsV2)) {
+    return textPanel(content)
+  }
+  return close ? { content, components: [] } : { content }
 }
 
 function isWaveAction(action: string): action is WaveAction {

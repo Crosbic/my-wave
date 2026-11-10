@@ -4,6 +4,8 @@ import { after, before, describe, it, TestContext } from 'node:test'
 import path from 'path'
 import { setTimeout as sleep } from 'timers/promises'
 
+import { MessageEditOptions } from 'discord.js'
+
 import {
   buttons,
   createTestSession,
@@ -21,7 +23,7 @@ import { YandexAuthError } from '../src/errors/yandexAuthError.js'
 import { WaveSession } from '../src/services/wave-session.js'
 import { WaveFeedback, YandexMusicService } from '../src/services/yandex-music.service.js'
 import { WaveChoice } from '../src/types/waveSettings.js'
-import { IStationBatch } from '../src/types/yandexTrack.js'
+import { IStationBatch, IYandexTrack } from '../src/types/yandexTrack.js'
 
 const yandex = YandexMusicService.getInstance()
 
@@ -125,6 +127,9 @@ function describeFeedback(feedback: { sessionId: string; item: WaveFeedback }[])
 }
 
 const batch = (batchId: string, ...ids: string[]): IStationBatch => ({ batchId, tracks: ids.map(id => track(id)) })
+const ids = (tracks: IYandexTrack[]) => tracks.map(item => item.id)
+const showsTrack = (options: MessageEditOptions | undefined, id: string) =>
+  embedDescription(options)?.startsWith(`**Track ${id}**`) ?? false
 
 const ACTIVE: WaveChoice = { moodEnergy: { seed: 'settingMoodEnergy:active', name: 'Бодрое' } }
 const WORKOUT_ACTIVE: WaveChoice = {
@@ -337,6 +342,111 @@ describe('WaveSession', () => {
     assert.equal(yandexStub.started('12'), 1)
   })
 
+  it('трек из истории сразу играет, текущий уходит в историю, а волна продолжается', async t => {
+    const yandexStub = stubYandex(t, { batches: [batch('b1', '11', '12', '13'), batch('b2', '21')], clip: 'long' })
+    const { session } = startedSession(t)
+
+    await session.start()
+    await waitForStart(session, yandexStub.started, '11')
+    await session.skip()
+    await waitForStart(session, yandexStub.started, '12')
+    await session.skip()
+    await waitForStart(session, yandexStub.started, '13')
+    assert.deepEqual(ids(session.recentTracks), ['12', '11'], 'последний сыгранный — первым')
+
+    assert.equal(await session.playFromHistory('11'), 'ok')
+    assert.equal(session.currentTrack?.id, '11')
+    assert.deepEqual(ids(session.recentTracks), ['13', '12'])
+
+    assert.equal(await session.playFromHistory('11'), 'ok', 'трек уже играет')
+    assert.equal(await session.playFromHistory('99'), 'missing')
+    assert.equal(session.currentTrack?.id, '11')
+
+    await session.skip()
+    await waitForStart(session, yandexStub.started, '21')
+    assert.deepEqual(ids(session.recentTracks), ['11', '13', '12'], 'после выбранного трека играют новые треки волны')
+
+    // Прерванный трек засчитывается волне как пропуск, а выбранный играет повторно и фидбэка не шлёт
+    assert.deepEqual(describeFeedback(yandexStub.feedback), [
+      's1 radioStarted',
+      's1 trackStarted 11:100',
+      's1 skip 11:100',
+      's1 trackStarted 12:100',
+      's1 skip 12:100',
+      's1 trackStarted 13:100',
+      's1 skip 13:100',
+      's1 trackStarted 21:100'
+    ])
+  })
+
+  it('⏮️ возвращает трек, который прервал выбор в истории', async t => {
+    const yandexStub = stubYandex(t, { batches: [batch('b1', '11', '12')], clip: 'long' })
+    const { session, edits } = startedSession(t)
+
+    await session.start()
+    await waitForStart(session, yandexStub.started, '11')
+    await session.skip()
+    await waitForStart(session, yandexStub.started, '12')
+
+    // Единственный трек истории уходит из неё, а прерванный приходит на его место: кнопки остаются доступны
+    assert.equal(await session.playFromHistory('11'), 'ok')
+    await waitFor(() => {
+      const last = edits.at(-1)
+      return showsTrack(last, '11') && buttons(last).previous && buttons(last).history
+    }, 'плеер показал выбранный трек, ⏮️ и 📜 доступны')
+
+    assert.equal(await session.previous(), 'ok')
+    assert.equal(session.currentTrack?.id, '12')
+  })
+
+  it('после ⏮️ в истории есть и треки, к которым вернёт ⏭️, и их можно выбрать', async t => {
+    const yandexStub = stubYandex(t, { batches: [batch('b1', '11', '12', '13')], clip: 'long' })
+    const { session, edits } = startedSession(t)
+
+    await session.start()
+    await waitForStart(session, yandexStub.started, '11')
+    await session.skip()
+    await waitForStart(session, yandexStub.started, '12')
+    await session.skip()
+    await waitForStart(session, yandexStub.started, '13')
+    assert.equal(await session.previous(), 'ok')
+    assert.equal(await session.previous(), 'ok')
+
+    assert.equal(session.currentTrack?.id, '11')
+    assert.deepEqual(ids(session.recentTracks), ['12', '13'], '12 прерван последним')
+    // Раньше 11 ничего не играло, но в истории есть треки, к которым вернёт ⏭️
+    await waitFor(() => {
+      const last = edits.at(-1)
+      return showsTrack(last, '11') && !buttons(last).previous && buttons(last).history
+    }, '⏮️ выключена, а 📜 доступна')
+
+    assert.equal(await session.playFromHistory('13'), 'ok')
+    assert.deepEqual(ids(session.recentTracks), ['11', '12'])
+    await session.skip()
+    assert.equal(session.currentTrack?.id, '12', '⏭️ ведёт к оставшемуся после ⏮️ треку')
+  })
+
+  it('если трек из истории не запустился, играет прежний, а история не меняется', async t => {
+    let unavailable = false
+    const yandexStub = stubYandex(t, {
+      batches: [batch('b1', '11', '12')],
+      streamFile: id => (unavailable && id === '11' ? null : longClip)
+    })
+    const { session } = startedSession(t)
+
+    await session.start()
+    await waitForStart(session, yandexStub.started, '11')
+    await session.skip()
+    await waitForStart(session, yandexStub.started, '12')
+
+    unavailable = true
+    assert.equal(await session.playFromHistory('11'), 'failed')
+    assert.equal(session.currentTrack?.id, '12')
+    assert.equal(playerStatus(session), 'playing')
+    assert.deepEqual(ids(session.recentTracks), ['11'])
+    assert.ok(!yandexStub.feedback.some(({ item }) => item.type === 'skip' && item.trackId === '12:100'))
+  })
+
   it('битый трек запускается не больше трёх раз, затем играет следующий', async t => {
     const yandexStub = stubYandex(t, {
       batches: [{ batchId: 'b1', tracks: [track('11', 200_000), track('12')] }],
@@ -351,7 +461,7 @@ describe('WaveSession', () => {
     assert.ok(!yandexStub.feedback.some(({ item }) => 'trackId' in item && item.trackId === '11:100'))
   })
 
-  it('кнопки ⏮️, 👍 и ⏸️ выключены, пока ими нельзя воспользоваться', async t => {
+  it('кнопки ⏮️, 📜, 👍 и ⏸️ выключены, пока ими нельзя воспользоваться', async t => {
     const yandexStub = stubYandex(t, { batches: [batch('b1', '11', '12')], clip: 'long' })
     const { session, edits } = startedSession(t)
 
@@ -364,6 +474,7 @@ describe('WaveSession', () => {
       pause: true,
       stop: true,
       next: true,
+      history: false,
       settings: true,
       carousel: true
     })
@@ -377,12 +488,14 @@ describe('WaveSession', () => {
       pause: false,
       stop: true,
       next: true,
+      history: true,
       settings: true,
       carousel: true
     })
     await skipping
     await waitFor(() => buttons(edits.at(-1)).like, 'плеер показал следующий трек')
     assert.equal(buttons(edits.at(-1)).previous, true)
+    assert.equal(buttons(edits.at(-1)).history, true)
   })
 
   it('пауза и продолжение меняют кнопку', async t => {

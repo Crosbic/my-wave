@@ -6,7 +6,7 @@ import Database from 'better-sqlite3'
 
 import { parseWaveChoice } from './wave-settings.js'
 import config from '../config.js'
-import { IUserData } from '../types/userData.js'
+import { IUserData, StoredUser, YandexTokens } from '../types/userData.js'
 import { WaveChoice } from '../types/waveSettings.js'
 import { decrypt, encrypt, isEncrypted } from '../utils/crypto.js'
 import { logger } from '../utils/logger.js'
@@ -24,6 +24,8 @@ const log = logger.child('db')
 interface UserRow {
   discord_id: string
   access_token: string
+  refresh_token: string | null
+  token_expires_at: number | null
   yandex_id: string
   full_name: string | null
   first_name: string | null
@@ -112,6 +114,18 @@ const MIGRATIONS: Migration[] = [
         )
       `)
     }
+  },
+  {
+    version: 4,
+    description: 'refresh-токены и срок действия токенов Яндекса',
+    up: db => {
+      // Заполняются только для токенов, полученных входом по коду. refresh_token шифруется, как и access_token,
+      // а token_expires_at — время истечения access_token в мс с начала эпохи
+      db.exec(`
+        ALTER TABLE users ADD COLUMN refresh_token TEXT;
+        ALTER TABLE users ADD COLUMN token_expires_at INTEGER;
+      `)
+    }
   }
 ]
 
@@ -161,14 +175,20 @@ export class DatabaseService {
     return this.db.pragma('user_version', { simple: true }) as number
   }
 
-  saveUserToken(discordId: string, accessToken: string, userInfo: IUserData): void {
+  /**
+   * Сохраняет токены и данные аккаунта. Новый токен заменяет прежний целиком: у токена, вставленного вручную,
+   * не остаётся refresh-токена от предыдущего входа
+   */
+  saveUserToken(discordId: string, tokens: YandexTokens, userInfo: IUserData): void {
     const stmt = this.db.prepare(`
       INSERT INTO users (
-        discord_id, access_token, yandex_id, full_name, first_name, last_name,
+        discord_id, access_token, refresh_token, token_expires_at, yandex_id, full_name, first_name, last_name,
         nick_name, avatar_url, has_plus, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
       ON CONFLICT(discord_id) DO UPDATE SET
         access_token = excluded.access_token,
+        refresh_token = excluded.refresh_token,
+        token_expires_at = excluded.token_expires_at,
         yandex_id = excluded.yandex_id,
         full_name = excluded.full_name,
         first_name = excluded.first_name,
@@ -181,7 +201,9 @@ export class DatabaseService {
 
     stmt.run(
       discordId,
-      encrypt(accessToken),
+      encrypt(tokens.accessToken),
+      tokens.refreshToken ? encrypt(tokens.refreshToken) : null,
+      tokens.expiresAt ?? null,
       userInfo.id,
       userInfo.fullName,
       userInfo.firstName,
@@ -204,10 +226,10 @@ export class DatabaseService {
     return result.changes > 0
   }
 
-  getUserData(discordId: string): { accessToken: string; userInfo: IUserData } | undefined {
+  getUserData(discordId: string): StoredUser | undefined {
     const stmt = this.db.prepare(`
       SELECT
-        access_token, yandex_id, full_name, first_name, last_name,
+        access_token, refresh_token, token_expires_at, yandex_id, full_name, first_name, last_name,
         nick_name, avatar_url, has_plus
       FROM users
       WHERE discord_id = ?
@@ -220,8 +242,10 @@ export class DatabaseService {
     }
 
     let accessToken: string
+    let refreshToken: string | undefined
     try {
       accessToken = decrypt(row.access_token)
+      refreshToken = row.refresh_token ? decrypt(row.refresh_token) : undefined
     } catch (error) {
       // Пользователь сможет заново выполнить /login, и токен перезапишется
       log.error(
@@ -233,6 +257,8 @@ export class DatabaseService {
 
     return {
       accessToken,
+      refreshToken,
+      expiresAt: row.token_expires_at ?? undefined,
       userInfo: {
         id: row.yandex_id,
         fullName: row.full_name ?? '',
@@ -394,6 +420,8 @@ export class DatabaseService {
       )
       ON CONFLICT(discord_id) DO UPDATE SET
         access_token = excluded.access_token,
+        refresh_token = NULL,
+        token_expires_at = NULL,
         yandex_id = excluded.yandex_id,
         full_name = excluded.full_name,
         first_name = excluded.first_name,

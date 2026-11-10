@@ -3,7 +3,7 @@ import fs from 'fs'
 import path from 'path'
 import { setTimeout as sleep } from 'timers/promises'
 
-import { Collection, Message, MessageEditOptions, VoiceBasedChannel } from 'discord.js'
+import { Collection, ComponentType, Message, MessageEditOptions, VoiceBasedChannel } from 'discord.js'
 
 import { AudioPlayer, VoiceConnection, VoiceConnectionStatus } from '@discordjs/voice'
 
@@ -155,6 +155,44 @@ export function buttons(options: MessageEditOptions | undefined): Record<string,
       .flatMap(row => row.toJSON().components)
       .map(button => [button.custom_id.replace('wave:', ''), !button.disabled])
   )
+}
+
+interface ComponentJson {
+  type: number
+  content?: string
+  custom_id?: string
+  label?: string
+  disabled?: boolean
+  components?: ComponentJson[]
+  accessory?: ComponentJson
+}
+
+/**
+ * Панель из компонентов V2 так, как её увидит пользователь: тексты, секции (текст и customId кнопки рядом с ним)
+ * и кнопки в рядах: customId, подпись и доступна ли кнопка
+ */
+export function readComponentsPanel(components: readonly unknown[] | undefined) {
+  const texts: string[] = []
+  const sections: { text: string; button?: string }[] = []
+  const buttons: { id?: string; label?: string; enabled: boolean }[] = []
+
+  const visit = (component: ComponentJson): void => {
+    if (component.type === ComponentType.TextDisplay) {
+      texts.push(component.content ?? '')
+    } else if (component.type === ComponentType.Section) {
+      const text = (component.components ?? []).map(item => item.content).join('\n')
+      sections.push({ text, button: component.accessory?.custom_id })
+    } else if (component.type === ComponentType.Button) {
+      buttons.push({ id: component.custom_id, label: component.label, enabled: !component.disabled })
+    } else {
+      component.components?.forEach(visit)
+    }
+  }
+
+  // Через JSON, как при отправке в Discord: билдеры превращаются в объекты API
+  const json = JSON.parse(JSON.stringify(components ?? [])) as ComponentJson[]
+  json.forEach(visit)
+  return { texts, sections, buttons }
 }
 
 export function embedDescription(options: MessageEditOptions | undefined): string | undefined {

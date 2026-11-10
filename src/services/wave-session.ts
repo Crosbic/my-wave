@@ -39,7 +39,8 @@ import { UserFacingError } from '../utils/errors.js'
 import { Logger, logger } from '../utils/logger.js'
 
 const VOLUME = 0.8 // Чтоб не оглохли
-const HISTORY_SIZE = 10
+// Пять страниц «📜 Истории»
+const HISTORY_SIZE = 25
 // Сколько последних треков передаём волне в queue, как веб-клиент Яндекс Музыки
 const RECENT_QUEUE_SIZE = 2
 // Сколько раз запускаем трек, если поток оборвался в первые retryWindow мс
@@ -82,7 +83,8 @@ const COLOR_STOPPED = '#FF0000'
 const FOOTER = 'Яндекс Музыка'
 
 export const WAVE_BUTTON_PREFIX = 'wave:'
-export type WaveAction = 'like' | 'previous' | 'pause' | 'resume' | 'stop' | 'next' | 'settings' | 'carousel' | 'reset'
+export type WaveAction =
+  'like' | 'previous' | 'pause' | 'resume' | 'stop' | 'next' | 'history' | 'settings' | 'carousel' | 'reset'
 
 type EndReason = 'finished' | 'skip' | 'error'
 
@@ -93,6 +95,8 @@ interface QueueItem {
   batchId: string | null
   // Фидбэк волны отправляется только для первого воспроизведения трека
   feedback: 'pending' | 'started' | 'done'
+  // Номер последнего запуска трека: по нему «📜 История» показывает последние треки первыми
+  lastPlay?: number
 }
 
 interface Playback {
@@ -144,12 +148,15 @@ export class WaveSession {
   private current: Playback | null = null
   private failedResource: AudioResource | null = null
   private failedTracks = 0
+  private plays = 0
 
   private tasks: Promise<void> = Promise.resolve()
   private feedbackQueue: Promise<unknown> = Promise.resolve()
   private busy = false
   private destroyed = false
   private endReason: string | null = null
+  // Яндекс отклонил токен владельца: волна заиграет снова, только когда он войдёт заново
+  private rejectedToken = false
   private renderQueue: Promise<void> = Promise.resolve()
   private renderPending = false
 
@@ -223,6 +230,7 @@ export class WaveSession {
           paused: false,
           hasTrack: false,
           hasPrevious: false,
+          hasHistory: false,
           hasSettings: !isDefaultChoice(options.choice)
         })
       })
@@ -251,8 +259,21 @@ export class WaveSession {
     return this.endReason
   }
 
+  get tokenRejected(): boolean {
+    return this.rejectedToken
+  }
+
   get waveChoice(): WaveChoice {
     return this.choice
+  }
+
+  /**
+   * Сыгранные треки, кроме текущего, последний — первым. После ⏮️ сюда входят и треки, к которым вернёт ⏭️
+   */
+  get recentTracks(): IYandexTrack[] {
+    return [...this.history, ...this.upcoming]
+      .sort((a, b) => (b.lastPlay ?? 0) - (a.lastPlay ?? 0))
+      .map(item => item.track)
   }
 
   /**
@@ -331,6 +352,46 @@ export class WaveSession {
     return result
   }
 
+  /**
+   * Выбор в «📜 Истории»: трек сразу играет, а текущий уходит в историю, как после ⏭️, и волна продолжается
+   * как шла. Если трек не запустился, играет прежний. missing — трека уже нет среди сыгранных
+   */
+  async playFromHistory(trackId: string): Promise<'ok' | 'missing' | 'failed'> {
+    let result: 'ok' | 'missing' | 'failed' = 'failed'
+
+    await this.run(async () => {
+      // Пока список был открыт, к треку могли вернуться кнопкой ⏮️
+      if (this.current?.item.track.id === trackId) {
+        result = 'ok'
+        return
+      }
+
+      const played = [this.history, this.upcoming].find(items => items.some(item => item.track.id === trackId))
+      if (!played) {
+        result = 'missing'
+        return
+      }
+
+      const index = played.findIndex(item => item.track.id === trackId)
+      const [picked] = played.splice(index, 1)
+      const interrupted = this.current
+      if (!(await this.play(picked))) {
+        played.splice(index, 0, picked)
+        return
+      }
+
+      if (interrupted) {
+        this.sendEndFeedback(interrupted, 'skip')
+        this.remember(interrupted.item)
+        // play() уже перерисовал плеер, а прерванного трека тогда ещё не было в истории
+        this.render()
+      }
+      result = 'ok'
+    })
+
+    return result
+  }
+
   pause(): boolean {
     if (this.destroyed) {
       return false
@@ -388,8 +449,9 @@ export class WaveSession {
         await task()
       } catch (error) {
         if (error instanceof YandexAuthError) {
+          this.rejectedToken = true
           void this.destroy(
-            'Токен Яндекса владельца плеера недействителен или истёк. Обновите его: `/login-help`, затем `/login`.'
+            'Токен Яндекса владельца плеера недействителен или истёк. Владельцу нужно войти заново командой `/login`.'
           )
         } else {
           this.log.error('Ошибка плеера', error)
@@ -456,6 +518,7 @@ export class WaveSession {
     const resource = createTrackResource(stream)
     resource.volume?.setVolume(VOLUME)
 
+    item.lastPlay = ++this.plays
     this.current = { item, resource, attempt }
     this.failedResource = null
     this.player.play(resource)
@@ -743,6 +806,7 @@ export class WaveSession {
       paused: this.player.state.status === AudioPlayerStatus.Paused,
       hasTrack: !!track,
       hasPrevious: this.history.length > 0,
+      hasHistory: this.history.length + this.upcoming.length > 0,
       hasSettings: !isDefaultChoice(this.choice)
     })
     return {
@@ -818,22 +882,26 @@ interface ControlsState {
   paused: boolean
   hasTrack: boolean
   hasPrevious: boolean
+  // Есть сыгранные треки: после ⏮️ это и треки, к которым вернёт ⏭️
+  hasHistory: boolean
   // Играет подборка или не «Любое» в какой-то группе: тогда настройки можно сбросить
   hasSettings: boolean
 }
 
 /**
  * Кнопки плеера. Недоступные сейчас действия выключены, чтобы не объяснять их сообщениями.
- * В ряду помещается не больше пяти кнопок, поэтому настройки волны во втором ряду.
+ * В ряду помещается не больше пяти кнопок, поэтому история и настройки волны во втором ряду.
  * Кнопка сброса появляется, только когда сбрасывать есть что
  */
 function controlsRows({
   paused,
   hasTrack,
   hasPrevious,
+  hasHistory,
   hasSettings
 }: ControlsState): ActionRowBuilder<ButtonBuilder>[] {
   const waveRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    controlButton('history', '📜 История').setDisabled(!hasHistory),
     controlButton('settings', '⚙️ Настроить волну'),
     controlButton('carousel', '🎡 Подборки')
   )

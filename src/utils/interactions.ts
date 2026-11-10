@@ -53,7 +53,10 @@ export async function dismiss(interaction: RepliableInteraction): Promise<void> 
   }
 }
 
-function deleteLater(interaction: RepliableInteraction, message: string, ttl: number): void {
+/**
+ * Удаляет ответ на взаимодействие через ttl мс. message — id сообщения или '@original'
+ */
+export function deleteLater(interaction: RepliableInteraction, message: string, ttl: number): void {
   setTimeout(() => {
     interaction.deleteReply(message).catch(error => {
       logger.error('Не удалось удалить уведомление', error)

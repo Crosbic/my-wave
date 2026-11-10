@@ -1,14 +1,16 @@
 import assert from 'node:assert/strict'
 import { describe, it, TestContext } from 'node:test'
 
-import { ChatInputCommandInteraction, Collection, MessageComponentInteraction } from 'discord.js'
+import { ChatInputCommandInteraction, Collection, MessageComponentInteraction, MessageFlags } from 'discord.js'
 
+import { readComponentsPanel, track } from './helpers.js'
 import { execute } from '../src/commands/my-wave.js'
 import { DatabaseService } from '../src/services/database.service.js'
 import { PlayerService, StartWaveOptions } from '../src/services/player.service.js'
 import {
   carouselPanel,
   describeChoice,
+  historyPanel,
   isDefaultChoice,
   isReshuffle,
   parsePanelId,
@@ -182,6 +184,56 @@ describe('настройки волны', () => {
     assert.equal(carouselPanel([tooLong], {}, '123'), null, 'показывать нечего')
   })
 
+  it('история показывает по пять треков с кнопкой ▶️ у каждого и листается', () => {
+    const tracks = Array.from({ length: 12 }, (_, index) => track(String(12 - index)))
+    const first = historyPanel(tracks, '123', 0)
+    assert.equal(first.flags, MessageFlags.IsComponentsV2)
+
+    const firstPage = readComponentsPanel(first.components)
+    assert.deepEqual(firstPage.texts, ['### 📜 История'])
+    assert.deepEqual(
+      firstPage.sections,
+      ['12', '11', '10', '9', '8'].map(id => ({
+        text: `**Track ${id}**\n-# Artist`,
+        button: `wave-settings:123:history-play:0:${id}`
+      }))
+    )
+    assert.deepEqual(firstPage.buttons, [
+      { id: 'wave-settings:123:history-page:-1', label: '⬅️', enabled: false },
+      { id: 'wave-settings:123:history-page:0', label: '1 / 3', enabled: false },
+      { id: 'wave-settings:123:history-page:1', label: '➡️', enabled: true }
+    ])
+
+    const lastPage = readComponentsPanel(historyPanel(tracks, '123', 2).components)
+    assert.deepEqual(
+      lastPage.sections.map(section => section.button),
+      ['wave-settings:123:history-play:2:2', 'wave-settings:123:history-play:2:1']
+    )
+    assert.deepEqual(
+      lastPage.buttons.map(button => [button.label, button.enabled]),
+      [
+        ['⬅️', true],
+        ['3 / 3', false],
+        ['➡️', false]
+      ]
+    )
+    assert.deepEqual(readComponentsPanel(historyPanel(tracks, '123', 7).components), lastPage, 'история стала короче')
+  })
+
+  it('на одной странице истории нет листания, повторы убраны, а разметка в названиях экранирована', () => {
+    const duet = { ...track('13'), title: 'Песня *со звёздочками*', artists: [{ name: 'Первый' }, { name: 'Второй' }] }
+    const page = readComponentsPanel(
+      historyPanel([duet, { ...track('12'), artists: [] }, duet], '123', 0, 'Пояснение').components
+    )
+
+    assert.deepEqual(page.texts, ['### 📜 История\nПояснение'])
+    assert.deepEqual(page.sections, [
+      { text: '**Песня \\*со звёздочками\\***\n-# Первый, Второй', button: 'wave-settings:123:history-play:0:13' },
+      { text: '**Track 12**', button: 'wave-settings:123:history-play:0:12' }
+    ])
+    assert.deepEqual(page.buttons, [])
+  })
+
   it('из сохранённого выбора остаются только значения, которые Яндекс Музыка предлагает сейчас', () => {
     const saved: WaveChoice = {
       activity: { seed: 'activity:party', name: 'Вечериниться' },
@@ -213,9 +265,19 @@ describe('настройки волны', () => {
   })
 
   it('разбирает customId панели и отбрасывает чужие', () => {
-    assert.deepEqual(parsePanelId('wave-settings:123:moodEnergy'), { playerMessageId: '123', field: 'moodEnergy' })
+    assert.deepEqual(parsePanelId('wave-settings:123:moodEnergy'), {
+      playerMessageId: '123',
+      field: 'moodEnergy',
+      args: []
+    })
     assert.equal(parsePanelId('wave-settings:123:default')?.field, 'default')
     assert.equal(parsePanelId('wave-settings:123:carousel')?.field, 'carousel')
+    assert.deepEqual(parsePanelId('wave-settings:123:history-play:2:11'), {
+      playerMessageId: '123',
+      field: 'history-play',
+      args: ['2', '11']
+    })
+    assert.deepEqual(parsePanelId('wave-settings:123:history-page:1')?.args, ['1'])
     assert.equal(parsePanelId('wave-settings:123:unknown'), null)
     assert.equal(parsePanelId('wave:settings'), null)
   })
@@ -223,7 +285,8 @@ describe('настройки волны', () => {
 
 interface PanelClick {
   customId: string
-  panel: SettingsPanel
+  // Панель, на которой нажали. Кнопкам «📜 Истории» она не нужна: всё нужное у них в customId
+  panel?: SettingsPanel
   values?: string[]
 }
 
@@ -234,11 +297,13 @@ function click(t: TestContext, { customId, panel, values }: PanelClick) {
   const updates: SettingsPanel[] = []
   const apply = t.mock.method(PlayerService.getInstance(), 'applyWaveSettings', async () => {})
   const play = t.mock.method(PlayerService.getInstance(), 'playCarouselWave', async () => {})
+  const replay = t.mock.method(PlayerService.getInstance(), 'playHistoryTrack', async () => {})
+  const turn = t.mock.method(PlayerService.getInstance(), 'showHistoryPage', async () => {})
 
   const interaction = {
     customId,
     values,
-    message: { components: panel.components },
+    message: { components: panel?.components ?? [] },
     isButton: () => !values,
     isStringSelectMenu: () => !!values,
     update: async (payload: SettingsPanel) => {
@@ -247,7 +312,7 @@ function click(t: TestContext, { customId, panel, values }: PanelClick) {
   }
 
   const done = PlayerService.getInstance().handleSettingsPanel(interaction as unknown as MessageComponentInteraction)
-  return { done, updates, apply, play }
+  return { done, updates, apply, play, replay, turn }
 }
 
 describe('панели под плеером', () => {
@@ -319,6 +384,20 @@ describe('панели под плеером', () => {
       { seeds: ['genre:electronics', 'local-language:instrumental'], name: 'Электроника без слов' }
     ])
     assert.equal(apply.mock.callCount(), 0)
+  })
+
+  it('▶️ в «📜 Истории» передаёт PlayerService трек и страницу, а листание — страницу', async t => {
+    const played = click(t, { customId: 'wave-settings:message-1:history-play:1:11' })
+    await played.done
+    assert.equal(played.replay.mock.callCount(), 1)
+    assert.deepEqual(played.replay.mock.calls[0].arguments.slice(1), ['message-1', 1, '11'])
+    assert.equal(played.turn.mock.callCount(), 0)
+
+    const turned = click(t, { customId: 'wave-settings:message-1:history-page:2' })
+    await turned.done
+    assert.equal(turned.turn.mock.callCount(), 1)
+    assert.deepEqual(turned.turn.mock.calls[0].arguments.slice(1), ['message-1', 2])
+    assert.equal(turned.replay.mock.callCount() + turned.apply.mock.callCount() + turned.play.mock.callCount(), 0)
   })
 })
 

@@ -1,13 +1,19 @@
 import assert from 'node:assert/strict'
 import { beforeEach, describe, it, TestContext } from 'node:test'
 
-import { ButtonInteraction, Collection, MessageFlags, StringSelectMenuInteraction } from 'discord.js'
+import {
+  ButtonInteraction,
+  Collection,
+  MessageFlags,
+  MessageFlagsBitField,
+  StringSelectMenuInteraction
+} from 'discord.js'
 
-import { track } from './helpers.js'
+import { readComponentsPanel, track } from './helpers.js'
 import { YandexAuthError } from '../src/errors/yandexAuthError.js'
 import { DatabaseService } from '../src/services/database.service.js'
 import { PlayerService } from '../src/services/player.service.js'
-import { describeChoice, readCarouselWave, readSettingsPanel, SettingsPanel } from '../src/services/wave-settings.js'
+import { describeChoice, readCarouselWave, readSettingsPanel } from '../src/services/wave-settings.js'
 import { YandexMusicService } from '../src/services/yandex-music.service.js'
 import { CarouselWave, WaveChoice, WaveSettingGroup } from '../src/types/waveSettings.js'
 import { LONG_NOTICE_TTL, SHORT_NOTICE_TTL } from '../src/utils/interactions.js'
@@ -43,6 +49,8 @@ class FakeSession {
   waveChoice: WaveChoice = ACTIVE
   stopReason: string | null = null
   previousResult: 'ok' | 'empty' | 'failed' = 'ok'
+  recentTracks = [track('10'), track('9')]
+  historyResult: 'ok' | 'missing' | 'failed' = 'ok'
   retuneResult = true
   calls: string[] = []
 
@@ -70,6 +78,11 @@ class FakeSession {
     return this.previousResult
   }
 
+  async playFromHistory(trackId: string) {
+    this.calls.push(`playFromHistory: ${trackId}`)
+    return this.historyResult
+  }
+
   async destroy(reason: string) {
     this.calls.push(`destroy: ${reason}`)
   }
@@ -80,33 +93,61 @@ interface PressOptions {
   messageId?: string
   serverAdmin?: boolean
   inVoiceChannel?: boolean
+  // Кнопка на панели из компонентов V2 («📜 История»)
+  componentsV2?: boolean
+}
+
+// Ответ на нажатие так, как его передаёт PlayerService
+interface Reply {
+  content?: string
+  components: { toJSON(): unknown }[]
+  flags?: number
 }
 
 /**
- * Нажатие кнопки: вызовы методов взаимодействия записываются в calls, а ответы с компонентами — в replies
+ * Ответ одной строкой: у панели из компонентов V2 — её тексты, у обычного сообщения — текст
+ * и пометка, если кнопки и списки убраны
+ */
+function describeReply(reply: Reply): string {
+  if (new MessageFlagsBitField(reply.flags ?? 0).has(MessageFlags.IsComponentsV2)) {
+    return `[V2] ${readComponentsPanel(reply.components).texts.join(' | ')}`
+  }
+  return reply.content ? `${reply.content}${reply.components?.length === 0 ? ' (без кнопок)' : ''}` : ''
+}
+
+/**
+ * Нажатие кнопки: вызовы методов взаимодействия записываются в calls, а ответы — в replies
  */
 function buttonInteraction(customId: string, options: PressOptions = {}) {
   const { user = 'owner', messageId = 'message-1', serverAdmin = false, inVoiceChannel = true } = options
   const calls: string[] = []
-  const replies: (SettingsPanel & { flags?: number })[] = []
+  const replies: Reply[] = []
+  const record = (method: string, reply?: Reply) => {
+    const text = reply ? describeReply(reply) : ''
+    calls.push(text ? `${method}: ${text}` : method)
+    if (reply) {
+      replies.push(reply)
+    }
+  }
+
   const interaction = {
     customId,
     user: { id: user, username: user },
     guildId: 'guild-1',
     guild: { voiceStates: { cache: new Collection(inVoiceChannel ? [[user, { channelId: 'voice-1' }]] : []) } },
-    message: { id: messageId },
+    message: {
+      id: messageId,
+      flags: new MessageFlagsBitField(options.componentsV2 ? MessageFlags.IsComponentsV2 : 0)
+    },
     memberPermissions: { has: () => serverAdmin },
-    deferUpdate: async () => calls.push('deferUpdate'),
-    followUp: async (reply: SettingsPanel & { flags?: number }) => {
-      calls.push(`followUp: ${reply.content}`)
-      replies.push(reply)
+    deferUpdate: async () => record('deferUpdate'),
+    followUp: async (reply: Reply) => {
+      record('followUp', reply)
       return { id: `notice-${calls.length}` }
     },
     deleteReply: async (target?: string) => calls.push(`deleteReply: ${target ?? '@original'}`),
-    editReply: async (reply: { content: string; components?: unknown[] }) =>
-      calls.push(`editReply: ${reply.content}${reply.components ? ' (без кнопок)' : ''}`),
-    update: async (reply?: { content?: string; components?: unknown[] }) =>
-      calls.push(reply?.content ? `update: ${reply.content}${reply.components ? ' (без кнопок)' : ''}` : 'update')
+    editReply: async (reply: Reply) => record('editReply', reply),
+    update: async (reply?: Reply) => record('update', reply)
   }
 
   return { interaction: interaction as unknown as ButtonInteraction, calls, replies }
@@ -140,6 +181,36 @@ function pick(wave: CarouselWave, options: PressOptions = {}) {
     wave
   )
   return { calls, done }
+}
+
+/**
+ * Нажатие ▶️ у трека на странице page «📜 Истории»
+ */
+function choose(trackId: string, options: PressOptions & { playerMessageId?: string; page?: number } = {}) {
+  const page = options.page ?? 0
+  const { interaction, calls, replies } = buttonInteraction(`wave-settings:message-1:history-play:${page}:${trackId}`, {
+    ...options,
+    componentsV2: true
+  })
+  const done = PlayerService.getInstance().playHistoryTrack(
+    interaction,
+    options.playerMessageId ?? 'message-1',
+    page,
+    trackId
+  )
+  return { calls, replies, done }
+}
+
+/**
+ * Листание «📜 Истории» на страницу page
+ */
+function turn(page: number, options: PressOptions & { playerMessageId?: string } = {}) {
+  const { interaction, calls, replies } = buttonInteraction(`wave-settings:message-1:history-page:${page}`, {
+    ...options,
+    componentsV2: true
+  })
+  const done = PlayerService.getInstance().showHistoryPage(interaction, options.playerMessageId ?? 'message-1', page)
+  return { calls, replies, done }
 }
 
 let session: FakeSession
@@ -282,6 +353,121 @@ describe('PlayerService: кнопки плеера', () => {
     const foreignButton = press('other:button')
     await foreignButton.done
     assert.deepEqual(foreignButton.calls, [])
+    assert.deepEqual(session.calls, [])
+  })
+})
+
+// Семь сыгранных треков, последний — 17: две страницы истории
+const SEVEN_TRACKS = ['17', '16', '15', '14', '13', '12', '11'].map(id => track(id))
+
+describe('PlayerService: история', () => {
+  it('📜 открывает первую страницу истории, видимую только нажавшему', async t => {
+    stubDatabase(t)
+    session.recentTracks = SEVEN_TRACKS
+
+    const { calls, replies, done } = press('wave:history')
+    await done
+
+    assert.deepEqual(calls, ['deferUpdate', 'followUp: [V2] ### 📜 История'])
+    assert.equal(replies[0].flags, MessageFlags.Ephemeral | MessageFlags.IsComponentsV2)
+    const page = readComponentsPanel(replies[0].components)
+    assert.deepEqual(
+      page.sections.map(section => section.button),
+      ['17', '16', '15', '14', '13'].map(id => `wave-settings:message-1:history-play:0:${id}`)
+    )
+    assert.deepEqual(
+      page.buttons.map(button => button.label),
+      ['⬅️', '1 / 2', '➡️']
+    )
+    assert.deepEqual(session.calls, [])
+  })
+
+  it('листание собирает страницу заново по текущей истории', async t => {
+    stubDatabase(t)
+    session.recentTracks = SEVEN_TRACKS
+
+    const { calls, replies, done } = turn(1)
+    await done
+
+    assert.deepEqual(calls, ['update: [V2] ### 📜 История'])
+    assert.deepEqual(
+      readComponentsPanel(replies[0].components).sections.map(section => section.button),
+      ['wave-settings:message-1:history-play:1:12', 'wave-settings:message-1:history-play:1:11']
+    )
+  })
+
+  it('без сыгранных треков 📜 ничего не показывает, а без доступа объясняет отказ', async t => {
+    stubDatabase(t)
+
+    session.recentTracks = []
+    const empty = press('wave:history')
+    await empty.done
+    assert.deepEqual(empty.calls, ['deferUpdate'])
+
+    session.recentTracks = [track('10')]
+    const denied = press('wave:history', { user: 'stranger' })
+    await denied.done
+    assert.match(denied.calls[1], /^followUp: Только пользователь, запустивший воспроизведение/)
+  })
+
+  it('▶️ сразу включает трек, и история закрывается', async t => {
+    stubDatabase(t)
+
+    const { calls, done } = choose('9')
+    await done
+
+    assert.deepEqual(session.calls, ['playFromHistory: 9'])
+    assert.deepEqual(calls, ['deferUpdate', 'deleteReply: @original'])
+  })
+
+  it('если трек не запустился или пропал из истории, та же страница показывается заново с пояснением', async t => {
+    stubDatabase(t)
+    session.recentTracks = SEVEN_TRACKS
+
+    session.historyResult = 'failed'
+    const failed = choose('12', { page: 1 })
+    await failed.done
+    assert.deepEqual(failed.calls, [
+      'deferUpdate',
+      'editReply: [V2] ### 📜 История\nНе удалось включить трек, играет прежний. Попробуйте ещё раз.'
+    ])
+    assert.equal(readComponentsPanel(failed.replies[0].components).buttons[1].label, '2 / 2', 'та же страница')
+
+    session.historyResult = 'missing'
+    const missing = choose('12', { page: 1 })
+    await missing.done
+    assert.deepEqual(missing.calls, [
+      'deferUpdate',
+      'editReply: [V2] ### 📜 История\nЭтого трека уже нет в истории, список обновлён.'
+    ])
+  })
+
+  it('если плеер остановился, вместо истории видна причина', async t => {
+    stubDatabase(t)
+    session.historyResult = 'failed'
+    session.stopReason = 'Токен Яндекса владельца плеера недействителен или истёк.'
+
+    const { calls, done } = choose('9')
+    await done
+
+    assert.deepEqual(calls, ['deferUpdate', 'editReply: [V2] Токен Яндекса владельца плеера недействителен или истёк.'])
+  })
+
+  it('без доступа или со старой историей трек не включается, а вместо истории видно почему', async t => {
+    stubDatabase(t)
+
+    const denied = choose('9', { user: 'stranger' })
+    await denied.done
+    assert.match(denied.calls[0], /^update: \[V2\] Только пользователь, запустивший воспроизведение/)
+
+    const stale = choose('9', { playerMessageId: 'old-message' })
+    await stale.done
+    assert.deepEqual(stale.calls, ['update: [V2] Этот плеер больше не активен. Запустите волну командой `/my-wave`.'])
+
+    const staleTurn = turn(1, { playerMessageId: 'old-message' })
+    await staleTurn.done
+    assert.deepEqual(staleTurn.calls, stale.calls, 'листание старой истории тоже объясняет')
+
     assert.deepEqual(session.calls, [])
   })
 })

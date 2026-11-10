@@ -4,11 +4,16 @@ import {
   ButtonBuilder,
   ButtonStyle,
   ComponentType,
+  ContainerBuilder,
+  escapeMarkdown,
   MessageActionRowComponentBuilder,
-  StringSelectMenuBuilder
+  MessageFlags,
+  StringSelectMenuBuilder,
+  TextDisplayBuilder
 } from 'discord.js'
 
 import { CarouselWave, WaveChoice, WaveOption, WaveSettingGroup, WaveSettingKey } from '../types/waveSettings.js'
+import { IYandexTrack } from '../types/yandexTrack.js'
 
 export const MY_WAVE_SEED = 'user:onyourwave'
 // Сид плитки «Встряхнуть Мою волну» в карусели, к нему добавляется отметка времени: diversity:reshuffle_<мс>
@@ -27,12 +32,33 @@ const MAX_SELECT_OPTIONS = 25
 // Ограничение Discord на длину значения, названия и подписи пункта списка
 const MAX_OPTION_LENGTH = 100
 
-// carousel — список подборок из кнопки «🎡 Подборки» в плеере
-export type PanelField = WaveSettingKey | 'submit' | 'default' | 'reset' | 'carousel'
+export const HISTORY_PAGE_SIZE = 5
+// Полоса панели истории — цвета плеера
+const HISTORY_COLOR = 0xffcc00
+
+// carousel — список подборок из кнопки «🎡 Подборки» в плеере.
+// history-play и history-page — кнопки ▶️ и листания на панели «📜 История»
+export type PanelField = WaveSettingKey | 'submit' | 'default' | 'reset' | 'carousel' | 'history-play' | 'history-page'
+const PANEL_CONTROLS: readonly string[] = [
+  'submit',
+  'default',
+  'reset',
+  'carousel',
+  'history-play',
+  'history-page'
+] satisfies PanelField[]
 
 export interface SettingsPanel {
   content: string
   components: ActionRowBuilder<MessageActionRowComponentBuilder>[]
+}
+
+/**
+ * Панель из компонентов V2: в ней и текст — компонент, поэтому content у неё нет
+ */
+export interface ComponentsPanel {
+  components: (ContainerBuilder | TextDisplayBuilder)[]
+  flags: MessageFlags.IsComponentsV2
 }
 
 /**
@@ -284,23 +310,82 @@ export function readCarouselWave(
 }
 
 /**
- * Разбор customId компонента панели: wave-settings:<ID сообщения плеера>:<поле>
+ * Страница «📜 Истории»: сыгранные треки по пять, последний — первым, у каждого кнопка ▶️, а внизу листание.
+ * Собрана из компонентов V2: только в них кнопка стоит рядом с текстом. Номер страницы и ID трека хранятся
+ * в самих кнопках, поэтому между нажатиями боту ничего не нужно помнить. notice — пояснение под заголовком
  */
-export function parsePanelId(customId: string | undefined): { playerMessageId: string; field: PanelField } | null {
+export function historyPanel(
+  tracks: IYandexTrack[],
+  playerMessageId: string,
+  page: number,
+  notice?: string
+): ComponentsPanel {
+  // ID трека входит в customId кнопки, а Discord не примет две кнопки с одинаковым customId
+  const unique = tracks.filter((track, index) => tracks.findIndex(other => other.id === track.id) === index)
+  const pages = Math.max(1, Math.ceil(unique.length / HISTORY_PAGE_SIZE))
+  // Пока страница была открыта, история могла стать короче
+  const current = Math.min(Math.max(Math.trunc(page) || 0, 0), pages - 1)
+
+  const container = new ContainerBuilder()
+    .setAccentColor(HISTORY_COLOR)
+    .addTextDisplayComponents(text => text.setContent(notice ? `### 📜 История\n${notice}` : '### 📜 История'))
+    .addSeparatorComponents(separator => separator)
+
+  for (const track of unique.slice(current * HISTORY_PAGE_SIZE, (current + 1) * HISTORY_PAGE_SIZE)) {
+    const artists = track.artists.map(artist => artist.name).join(', ')
+    container.addSectionComponents(section =>
+      section
+        .addTextDisplayComponents(text =>
+          text.setContent(`**${escapeMarkdown(track.title)}**${artists ? `\n-# ${escapeMarkdown(artists)}` : ''}`)
+        )
+        .setButtonAccessory(button =>
+          button
+            .setCustomId(panelId(playerMessageId, 'history-play', String(current), track.id))
+            .setLabel('▶️')
+            .setStyle(ButtonStyle.Secondary)
+        )
+    )
+  }
+
+  if (pages > 1) {
+    container
+      .addSeparatorComponents(separator => separator)
+      .addActionRowComponents(row =>
+        row.addComponents(
+          historyPageButton(playerMessageId, current - 1, '⬅️').setDisabled(current === 0),
+          historyPageButton(playerMessageId, current, `${current + 1} / ${pages}`).setDisabled(true),
+          historyPageButton(playerMessageId, current + 1, '➡️').setDisabled(current === pages - 1)
+        )
+      )
+  }
+
+  return { components: [container], flags: MessageFlags.IsComponentsV2 }
+}
+
+/**
+ * Текст на месте панели из компонентов V2: content у такого сообщения быть не может
+ */
+export function textPanel(content: string): ComponentsPanel {
+  return { components: [new TextDisplayBuilder().setContent(content)], flags: MessageFlags.IsComponentsV2 }
+}
+
+/**
+ * Разбор customId компонента панели: wave-settings:<ID сообщения плеера>:<поле>[:<параметры>].
+ * Параметры есть у кнопок «📜 Истории»: номер страницы, а у ▶️ ещё и ID трека
+ */
+export function parsePanelId(
+  customId: string | undefined
+): { playerMessageId: string; field: PanelField; args: string[] } | null {
   if (!customId?.startsWith(WAVE_SETTINGS_PREFIX)) {
     return null
   }
 
-  const [playerMessageId, field] = customId.slice(WAVE_SETTINGS_PREFIX.length).split(':')
-  if (
-    !playerMessageId ||
-    !field ||
-    !(isWaveSettingKey(field) || field === 'submit' || field === 'default' || field === 'reset' || field === 'carousel')
-  ) {
+  const [playerMessageId, field, ...args] = customId.slice(WAVE_SETTINGS_PREFIX.length).split(':')
+  if (!playerMessageId || !field || !isPanelField(field)) {
     return null
   }
 
-  return { playerMessageId, field }
+  return { playerMessageId, field, args }
 }
 
 /**
@@ -310,8 +395,22 @@ export function optionByValue(group: WaveSettingGroup | undefined, value: string
   return value === ANY_VALUE ? undefined : group?.options.find(option => option.seed === value)
 }
 
-function panelId(playerMessageId: string, field: PanelField): string {
-  return `${WAVE_SETTINGS_PREFIX}${playerMessageId}:${field}`
+function panelId(playerMessageId: string, field: PanelField, ...args: string[]): string {
+  return [`${WAVE_SETTINGS_PREFIX}${playerMessageId}`, field, ...args].join(':')
+}
+
+function isPanelField(value: string): value is PanelField {
+  return isWaveSettingKey(value) || PANEL_CONTROLS.includes(value)
+}
+
+/**
+ * Кнопка листания «📜 Истории» на страницу page. У номера текущей страницы тот же вид, но он всегда выключен
+ */
+function historyPageButton(playerMessageId: string, page: number, label: string): ButtonBuilder {
+  return new ButtonBuilder()
+    .setCustomId(panelId(playerMessageId, 'history-page', String(page)))
+    .setLabel(label)
+    .setStyle(ButtonStyle.Secondary)
 }
 
 function isWaveOption(value: unknown): value is WaveOption {
