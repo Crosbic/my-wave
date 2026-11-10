@@ -27,13 +27,18 @@ export function removeDir(dir: string): void {
 }
 
 /**
- * WAV-файл с тишиной: ffmpeg читает его так же, как ссылку на трек
+ * WAV-файл с тишиной: ffmpeg читает его так же, как файл трека. По умолчанию в формате выхода ffmpeg
+ * (48 кГц, стерео, 16 бит), а 8 кГц моно 8 бит в 24 раза компактнее выхода, как MP3
  */
-export function writeSilentWav(file: string, seconds: number): string {
-  const sampleRate = 48_000
-  const channels = 2
-  const dataSize = Math.round(seconds * sampleRate) * channels * 2
-  const buffer = Buffer.alloc(44 + dataSize)
+export function writeSilentWav(
+  file: string,
+  seconds: number,
+  { sampleRate = 48_000, channels = 2, bits = 16 } = {}
+): string {
+  const blockAlign = channels * (bits / 8)
+  const dataSize = Math.round(seconds * sampleRate) * blockAlign
+  // Тишина в 8-битном WAV — 128, в 16-битном — 0
+  const buffer = Buffer.alloc(44 + dataSize, bits === 8 ? 128 : 0)
   buffer.write('RIFF', 0)
   buffer.writeUInt32LE(36 + dataSize, 4)
   buffer.write('WAVE', 8)
@@ -42,9 +47,9 @@ export function writeSilentWav(file: string, seconds: number): string {
   buffer.writeUInt16LE(1, 20)
   buffer.writeUInt16LE(channels, 22)
   buffer.writeUInt32LE(sampleRate, 24)
-  buffer.writeUInt32LE(sampleRate * channels * 2, 28)
-  buffer.writeUInt16LE(channels * 2, 32)
-  buffer.writeUInt16LE(16, 34)
+  buffer.writeUInt32LE(sampleRate * blockAlign, 28)
+  buffer.writeUInt16LE(blockAlign, 32)
+  buffer.writeUInt16LE(bits, 34)
   buffer.write('data', 36)
   buffer.writeUInt32LE(dataSize, 40)
   fs.writeFileSync(file, buffer)
@@ -172,4 +177,11 @@ export async function waitFor(predicate: () => boolean, label: string, timeout =
  */
 export function playerStatus(session: WaveSession): string {
   return (session as unknown as { player: AudioPlayer }).player.state.status
+}
+
+/**
+ * Сколько дочерних процессов (ffmpeg) ещё работает. Каждый держит процесс теста: node --test не завершится, пока они живы
+ */
+export function runningProcesses(): number {
+  return process.getActiveResourcesInfo().filter(type => type === 'ProcessWrap').length
 }

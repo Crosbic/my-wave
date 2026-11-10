@@ -1,4 +1,3 @@
-import { Readable } from 'stream'
 import { setTimeout as sleep } from 'timers/promises'
 
 import {
@@ -23,15 +22,14 @@ import {
   AudioPlayerStatus,
   AudioResource,
   createAudioPlayer,
-  createAudioResource,
   entersState,
   joinVoiceChannel,
   NoSubscriberBehavior,
-  StreamType,
   VoiceConnection,
   VoiceConnectionStatus
 } from '@discordjs/voice'
 
+import { createTrackResource, discard } from './track-resource.js'
 import { describeChoice, isDefaultChoice, waveSeeds } from './wave-settings.js'
 import { WaveFeedback, YandexMusicService } from './yandex-music.service.js'
 import { YandexAuthError } from '../errors/yandexAuthError.js'
@@ -454,8 +452,8 @@ export class WaveSession {
       return false
     }
 
-    // Плеер закрывает поток при смене трека и остановке, вместе с ним обрывается и загрузка файла
-    const resource = createAudioResource(stream, { inputType: StreamType.Arbitrary, inlineVolume: true })
+    // Плеер закрывает поток при смене трека и остановке, вместе с ним завершается ffmpeg и обрывается загрузка файла
+    const resource = createTrackResource(stream)
     resource.volume?.setVolume(VOLUME)
 
     this.current = { item, resource, attempt }
@@ -874,13 +872,4 @@ function destroyConnection(connection: VoiceConnection): void {
   if (connection.state.status !== VoiceConnectionStatus.Destroyed) {
     connection.destroy()
   }
-}
-
-/**
- * Закрытие ненужного потока трека. Недокачанный файл при закрытии сообщает об обрыве ошибкой,
- * а ошибка без обработчика уронила бы процесс
- */
-function discard(stream: Readable): void {
-  stream.on('error', () => {})
-  stream.destroy()
 }

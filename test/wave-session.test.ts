@@ -11,6 +11,7 @@ import {
   FAST_TIMINGS,
   playerStatus,
   removeDir,
+  runningProcesses,
   tempDir,
   track,
   waitFor,
@@ -27,12 +28,15 @@ const yandex = YandexMusicService.getInstance()
 let dir: string
 let shortClip: string
 let longClip: string
+let compactClip: string
 
 before(() => {
   dir = tempDir('wave-session')
   // Короткий клип успевает доиграть сам, длинный не заканчивается, пока тест нажимает кнопки
   shortClip = writeSilentWav(path.join(dir, 'short.wav'), 0.4)
   longClip = writeSilentWav(path.join(dir, 'long.wav'), 6)
+  // Компактный клип, как MP3: ffmpeg сразу получает файл целиком, а звук из него ещё долго не дочитан
+  compactClip = writeSilentWav(path.join(dir, 'compact.wav'), 10, { sampleRate: 8_000, channels: 1, bits: 8 })
 })
 
 after(() => removeDir(dir))
@@ -40,7 +44,7 @@ after(() => removeDir(dir))
 interface StubOptions {
   // Партии по порядку: и при создании сессии волны, и при запросе следующей. null — Яндекс Музыка завершила сессию
   batches?: (IStationBatch | null)[]
-  clip?: 'short' | 'long'
+  clip?: 'short' | 'long' | 'compact'
   brokenTracks?: string[]
   streamDelay?: number
   nextBatch?: () => Promise<IStationBatch | null>
@@ -72,7 +76,7 @@ function stubYandex(t: TestContext, options: StubOptions = {}) {
       await sleep(options.streamDelay)
     }
 
-    let file: string | null = options.clip === 'long' ? longClip : shortClip
+    let file: string | null = { short: shortClip, long: longClip, compact: compactClip }[options.clip ?? 'short']
     if (options.streamFile) {
       file = options.streamFile(trackId)
     } else if (options.brokenTracks?.includes(trackId)) {
@@ -450,5 +454,19 @@ describe('WaveSession', () => {
     const editsAfterStop = edits.length
     await sleep(300)
     assert.equal(edits.length, editsAfterStop)
+  })
+
+  it('⏭️ и ⏹️ завершают ffmpeg, даже если файл трека уже целиком передан ему', async t => {
+    const yandexStub = stubYandex(t, { batches: [batch('b1', '11', '12')], clip: 'compact' })
+    const { session } = startedSession(t)
+
+    await session.start()
+    await waitForStart(session, yandexStub.started, '11')
+    await session.skip()
+    await waitFor(() => runningProcesses() <= 1, 'ffmpeg пропущенного трека завершился')
+
+    await waitForStart(session, yandexStub.started, '12')
+    await session.destroy('Плеер был остановлен.')
+    await waitFor(() => runningProcesses() === 0, 'ffmpeg завершился вместе с плеером')
   })
 })
