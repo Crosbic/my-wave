@@ -7,6 +7,10 @@ import { registerEvents } from './events/index.js'
 import { DatabaseService } from './services/database.service.js'
 import { PlayerService } from './services/player.service.js'
 import { logger } from './utils/logger.js'
+import { describeVersion } from './version.js'
+
+// Первой строкой лога: по ней видно, обновился ли бот после деплоя
+logger.info(`Запуск бота: ${describeVersion()}`)
 
 const db = DatabaseService.getInstance()
 const playerService = PlayerService.getInstance()

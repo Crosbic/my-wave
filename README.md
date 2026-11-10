@@ -87,6 +87,18 @@ docker run -d --name my-wave --restart unless-stopped \
 
 Уровень логов задаётся переменной `LOG_LEVEL`: `debug`, `info`, `warn`, `error` или `silent`. По умолчанию `info`, а при `DEBUG=true` — `debug`.
 
+Первой строкой лога бот пишет коммит, из которого собран образ, по нему видно, обновился ли бот после деплоя:
+
+```
+Запуск бота: коммит 38c83b7 от 2026-11-10T14:01:39+03:00
+```
+
+Коммит и его дату CI передаёт при сборке через `--build-arg`. Если собираете образ вручную, передайте их сами, иначе в логе будет «коммит неизвестен»:
+
+```
+docker build --build-arg GIT_COMMIT=$(git rev-parse HEAD) --build-arg GIT_COMMIT_DATE=$(git log -1 --format=%cI) -t ympb-player-bot:master .
+```
+
 ## Разработка
 
 | Команда             | Что делает                                                                  |

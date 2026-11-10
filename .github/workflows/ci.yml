@@ -37,9 +37,14 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build
+        env:
+          # Дата из события push, а не из git log: checkout на runner без git обходится без каталога .git
+          COMMIT_DATE: ${{ github.event.head_commit.timestamp }}
         run: |
           docker build \
             --label org.opencontainers.image.revision=${{ github.sha }} \
+            --build-arg GIT_COMMIT=${{ github.sha }} \
+            --build-arg GIT_COMMIT_DATE="$COMMIT_DATE" \
             -t ympb-player-bot:master \
             -t ympb-player-bot:${{ github.sha }} \
             .

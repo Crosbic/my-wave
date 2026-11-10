@@ -24,6 +24,12 @@ COPY --from=builder /build/dist ./dist
 RUN mkdir -p /app/data && chown node:node /app/data
 VOLUME /app/data
 
+# Коммит, из которого собран образ: бот пишет его в лог при запуске. Передаёт CI через --build-arg.
+# ARG сбрасывает кэш всех RUN после себя, поэтому он в конце: иначе каждый коммит заново запускал бы yarn install
+ARG GIT_COMMIT=""
+ARG GIT_COMMIT_DATE=""
+ENV GIT_COMMIT="$GIT_COMMIT" GIT_COMMIT_DATE="$GIT_COMMIT_DATE"
+
 USER node
 
 # Запуск напрямую через node, чтобы SIGTERM доходил до бота и он корректно завершал работу
