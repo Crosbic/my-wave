@@ -8,14 +8,16 @@ on:
 jobs:
   checks:
     name: Проверки
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, box]
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
-          cache: yarn
+
+      - run: npm install -g yarn@1
 
       - run: yarn install --frozen-lockfile
       - run: yarn typecheck
@@ -25,34 +27,24 @@ jobs:
 
   docker:
     name: Образ Docker
-    # Образ собирается и публикуется только из master и только после успешных проверок
+
     needs: checks
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-    runs-on: ubuntu-latest
-    permissions:
-      packages: write
-      contents: read
+    runs-on: [self-hosted, box]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/crosbic/ympb-player-bot
-          tags: type=ref,event=branch
+      - name: Build
+        run: |
+          docker build \
+            --label org.opencontainers.image.revision=${{ github.sha }} \
+            -t ympb-player-bot:master \
+            -t ympb-player-bot:${{ github.sha }} \
+            .
 
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+      - name: Убрать старые образы
+        run: |
+          docker image ls ympb-player-bot --format '{{.Tag}}' \
+            | grep -v '^master$' | tail -n +4 \
+            | xargs -r -I{} docker image rm ympb-player-bot:{} || true
+          docker image prune -f
