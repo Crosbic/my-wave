@@ -2,8 +2,8 @@ import crypto from 'crypto'
 import { Readable } from 'stream'
 import { setTimeout as sleep } from 'timers/promises'
 
-import axios, { AxiosInstance, InternalAxiosRequestConfig, isAxiosError } from 'axios'
-import { Agent, request } from 'undici'
+import axios, { AxiosError, AxiosInstance, InternalAxiosRequestConfig, isAxiosError } from 'axios'
+import { Agent, Dispatcher, request } from 'undici'
 
 import { YandexAuthError } from '../errors/yandexAuthError.js'
 import { IUserData } from '../types/userData.js'
@@ -19,6 +19,9 @@ const REQUEST_TIMEOUT = 15_000
 const RATE_LIMIT_RETRIES = 2
 const RATE_LIMIT_DELAY = 1_000
 const MAX_RATE_LIMIT_DELAY = 5_000
+// Сбой сети или ответ 5xx обычно кратковременные: один повтор спасает трек, который иначе был бы пропущен
+const TRANSIENT_RETRIES = 1
+const TRANSIENT_DELAY = 1_000
 
 // Соль для подписи прямой ссылки на файл, как в эталонном клиенте MarshalX/yandex-music-api
 const SIGN_SALT = 'XGRlBW9FXlekgbPrRHuSiA'
@@ -145,6 +148,7 @@ export class YandexMusicService {
 
   private constructor() {
     retryOnRateLimit(this.http)
+    retryOnTransientError(this.http)
   }
 
   public static getInstance(): YandexMusicService {
@@ -326,10 +330,7 @@ export class YandexMusicService {
     }
 
     try {
-      const { statusCode, body } = await request(url, {
-        dispatcher: audioAgent,
-        maxRedirections: MAX_AUDIO_REDIRECTS
-      })
+      const { statusCode, body } = await requestAudio(url)
       if (statusCode !== 200) {
         // Тело ошибки дочитываем: закрытый недокачанным поток undici сообщает об обрыве ошибкой
         await body.dump()
@@ -492,7 +493,7 @@ export class YandexMusicService {
   }
 }
 
-type RateLimitedConfig = InternalAxiosRequestConfig & { rateLimitAttempt?: number }
+type RetriedConfig = InternalAxiosRequestConfig & { rateLimitAttempt?: number; transientAttempt?: number }
 
 /**
  * Повтор запросов, на которые Яндекс Музыка ответила 429. Пауза растёт с каждой попыткой,
@@ -503,7 +504,7 @@ export function retryOnRateLimit(
   { retries = RATE_LIMIT_RETRIES, delay = RATE_LIMIT_DELAY } = {}
 ): void {
   http.interceptors.response.use(undefined, async (error: unknown) => {
-    const config = isAxiosError(error) ? (error.config as RateLimitedConfig | undefined) : undefined
+    const config = isAxiosError(error) ? (error.config as RetriedConfig | undefined) : undefined
     if (!isAxiosError(error) || error.response?.status !== 429 || !config) {
       throw error
     }
@@ -522,6 +523,62 @@ export function retryOnRateLimit(
     await sleep(wait)
     return http.request(config)
   })
+}
+
+/**
+ * Повтор GET-запросов при сбое сети и ответах 5xx. GET ничего не меняет, поэтому повтор безопасен,
+ * а остальные запросы не повторяются: новая сессия волны или фидбэк задвоились бы
+ */
+export function retryOnTransientError(
+  http: AxiosInstance,
+  { retries = TRANSIENT_RETRIES, delay = TRANSIENT_DELAY } = {}
+): void {
+  http.interceptors.response.use(undefined, async (error: unknown) => {
+    const config = isAxiosError(error) ? (error.config as RetriedConfig | undefined) : undefined
+    if (!isAxiosError(error) || !config || config.method?.toLowerCase() !== 'get' || !isTransient(error)) {
+      throw error
+    }
+
+    const attempt = (config.transientAttempt ?? 0) + 1
+    if (attempt > retries) {
+      throw error
+    }
+
+    config.transientAttempt = attempt
+    const wait = attempt * delay
+    const failure = error.response ? `HTTP ${error.response.status}` : error.code
+    log.warn(
+      `Сбой запроса к Яндекс Музыке (${failure}), повтор ${attempt}/${retries} через ${wait} мс: ` +
+        `GET ${config.url?.split('?')[0]}`
+    )
+    await sleep(wait)
+    return http.request(config)
+  })
+}
+
+/**
+ * Сбой, который стоит повторить: ответа нет из-за сети или сервер ответил 5xx. Отменённый запрос не повторяется
+ */
+function isTransient(error: AxiosError): boolean {
+  const status = error.response?.status
+  return status === undefined ? error.code !== AxiosError.ERR_CANCELED : status >= 500
+}
+
+/**
+ * Запрос аудиофайла из хранилища. Сбой сети повторяется, как у запросов к API
+ */
+async function requestAudio(url: string): Promise<Dispatcher.ResponseData> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await request(url, { dispatcher: audioAgent, maxRedirections: MAX_AUDIO_REDIRECTS })
+    } catch (error) {
+      if (attempt > TRANSIENT_RETRIES) {
+        throw error
+      }
+      log.warn(`Не удалось подключиться к хранилищу, повтор ${attempt}/${TRANSIENT_RETRIES}`, error)
+      await sleep(attempt * TRANSIENT_DELAY)
+    }
+  }
 }
 
 /**

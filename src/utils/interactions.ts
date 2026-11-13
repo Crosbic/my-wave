@@ -1,10 +1,19 @@
-import { ButtonInteraction, MessageFlags, RepliableInteraction } from 'discord.js'
+import { ButtonInteraction, MessageFlags, RepliableInteraction, RESTJSONErrorCodes } from 'discord.js'
 
-import { logger } from './logger.js'
+import { isDiscordError } from './errors.js'
+import { logger, MessageLevel } from './logger.js'
 
 // Через сколько исчезают временные уведомления: короткие подтверждения и сообщения, которые нужно успеть прочитать
 export const SHORT_NOTICE_TTL = 5_000
 export const LONG_NOTICE_TTL = 15_000
+
+// Сообщения или взаимодействия уже нет: пользователь закрыл сообщение или взаимодействие истекло
+// (на ответ даётся 3 секунды, на изменения — 15 минут). Это не сбой бота
+const GONE_CODES = [
+  RESTJSONErrorCodes.UnknownMessage,
+  RESTJSONErrorCodes.UnknownInteraction,
+  RESTJSONErrorCodes.UnknownWebhook
+]
 
 /**
  * Отвечает пользователю, вызвавшему команду: учитывает отложенный ответ и никогда не бросает исключений.
@@ -26,7 +35,8 @@ export async function respond(interaction: RepliableInteraction, content: string
     }
     if (ttl) deleteLater(interaction, '@original', ttl)
   } catch (error) {
-    logger.error('Не удалось ответить на взаимодействие', error)
+    // Пользователь остался без ответа, даже если взаимодействие просто истекло
+    logFailure('Не удалось ответить на взаимодействие', error, { gone: 'warn', other: 'error' })
   }
 }
 
@@ -38,7 +48,7 @@ export async function notify(interaction: ButtonInteraction, content: string, tt
     const message = await interaction.followUp({ content, flags: MessageFlags.Ephemeral })
     deleteLater(interaction, message.id, ttl)
   } catch (error) {
-    logger.error('Не удалось отправить уведомление', error)
+    logFailure('Не удалось отправить уведомление', error, { gone: 'warn', other: 'error' })
   }
 }
 
@@ -49,7 +59,7 @@ export async function dismiss(interaction: RepliableInteraction): Promise<void> 
   try {
     await interaction.deleteReply()
   } catch (error) {
-    logger.error('Не удалось удалить ответ на взаимодействие', error)
+    logFailure('Не удалось удалить ответ на взаимодействие', error, { gone: 'debug', other: 'warn' })
   }
 }
 
@@ -59,7 +69,15 @@ export async function dismiss(interaction: RepliableInteraction): Promise<void> 
 export function deleteLater(interaction: RepliableInteraction, message: string, ttl: number): void {
   setTimeout(() => {
     interaction.deleteReply(message).catch(error => {
-      logger.error('Не удалось удалить уведомление', error)
+      // Чаще всего пользователь уже сам закрыл уведомление
+      logFailure('Не удалось удалить уведомление', error, { gone: 'debug', other: 'warn' })
     })
   }, ttl)
+}
+
+/**
+ * Сбой ответа на взаимодействие в лог. Если сообщения или взаимодействия уже нет, уровень ниже: это не сбой бота
+ */
+function logFailure(message: string, error: unknown, levels: { gone: MessageLevel; other: MessageLevel }): void {
+  logger[isDiscordError(error, ...GONE_CODES) ? levels.gone : levels.other](message, error)
 }

@@ -11,6 +11,8 @@ interface Config {
   encryptionKey: string
   dataDir?: string
   logLevel: LogLevel
+  // Цвет уровня в строке лога. undefined — только когда лог выводится в терминал
+  logColors?: boolean
 }
 
 const config: Config = {
@@ -24,7 +26,8 @@ const config: Config = {
   encryptionKey: process.env.ENCRYPTION_KEY || '',
   // Каталог базы пользователей. Если не задан — data/ в корне проекта (в Docker это /app/data)
   dataDir: process.env.DATA_DIR || undefined,
-  logLevel: resolveLogLevel()
+  logLevel: resolveLogLevel(),
+  logColors: resolveLogColors()
 }
 
 if (!config.token) {
@@ -54,6 +57,23 @@ function resolveLogLevel(): LogLevel {
 
   console.warn(`Неизвестный LOG_LEVEL "${process.env.LOG_LEVEL}", используется info`)
   return 'info'
+}
+
+/**
+ * Цвет уровней в логах: LOG_COLORS=true или false. Если не задан, решает логгер: цвет есть только в терминале
+ */
+function resolveLogColors(): boolean | undefined {
+  const value = process.env.LOG_COLORS?.trim().toLowerCase()
+  if (!value) {
+    return undefined
+  }
+
+  if (value === 'true' || value === 'false') {
+    return value === 'true'
+  }
+
+  console.warn(`Неизвестное значение LOG_COLORS "${process.env.LOG_COLORS}", ожидается true или false`)
+  return undefined
 }
 
 export default config

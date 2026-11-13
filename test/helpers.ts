@@ -1,12 +1,14 @@
 import { EventEmitter } from 'events'
 import fs from 'fs'
+import { TestContext } from 'node:test'
 import path from 'path'
 import { setTimeout as sleep } from 'timers/promises'
 
 import { Collection, ComponentType, Message, MessageEditOptions, VoiceBasedChannel } from 'discord.js'
 
-import { AudioPlayer, VoiceConnection, VoiceConnectionStatus } from '@discordjs/voice'
+import { AudioPlayer, NetworkingStatusCode, VoiceConnection, VoiceConnectionStatus } from '@discordjs/voice'
 
+import config from '../src/config.js'
 import { WaveSession, WaveTimings } from '../src/services/wave-session.js'
 import { WaveChoice } from '../src/types/waveSettings.js'
 import { IYandexTrack } from '../src/types/yandexTrack.js'
@@ -68,14 +70,59 @@ export function track(id: string, durationMs = 500): IYandexTrack {
 }
 
 /**
- * Голосовое соединение без сети: плееру достаточно, что оно в состоянии Ready и принимает пакеты
+ * Сессия сквозного шифрования (DAVE) голосового соединения: сессии важно, готова ли она
+ */
+export interface FakeDave {
+  protocolVersion: number
+  reinitializing: boolean
+  session: { ready: boolean }
+}
+
+interface FakeConnectionState {
+  status: VoiceConnectionStatus
+  networking?: { state: { code: NetworkingStatusCode; dave: FakeDave } }
+}
+
+interface FakeJoinConfig {
+  channelId: string | null
+  selfDeaf: boolean
+  selfMute: boolean
+}
+
+interface FakeSubscription {
+  unsubscribe(): void
+}
+
+/**
+ * Голосовое соединение без сети: плееру достаточно, что оно в состоянии Ready и принимает пакеты.
+ * Выход из канала и повторный вход ведут себя как в VoiceConnection, а состояние соединения меняет тест
  */
 export class FakeVoiceConnection extends EventEmitter {
-  state: { status: VoiceConnectionStatus } = { status: VoiceConnectionStatus.Ready }
-  joinConfig = { channelId: 'voice-1', guildId: 'guild-1' }
+  state: FakeConnectionState = { status: VoiceConnectionStatus.Ready, networking: fakeNetworking() }
+  joinConfig: FakeJoinConfig & { guildId: string } = {
+    channelId: 'voice-1',
+    guildId: 'guild-1',
+    selfDeaf: true,
+    selfMute: false
+  }
+  disconnects = 0
+  rejoins: FakeJoinConfig[] = []
+  private subscription: FakeSubscription | undefined
+
+  // Сессия DAVE текущего соединения с голосовым сервером
+  get dave(): FakeDave {
+    return this.state.networking!.state.dave
+  }
 
   subscribe(player: AudioPlayer) {
-    return (player as unknown as { subscribe(connection: unknown): unknown }).subscribe(this)
+    this.subscription = (player as unknown as { subscribe(connection: unknown): FakeSubscription }).subscribe(this)
+    return this.subscription
+  }
+
+  onSubscriptionRemoved(subscription: FakeSubscription) {
+    if (this.subscription === subscription) {
+      this.subscription = undefined
+    }
   }
 
   prepareAudioPacket() {}
@@ -86,12 +133,62 @@ export class FakeVoiceConnection extends EventEmitter {
 
   setSpeaking() {}
 
-  destroy() {
-    const oldState = this.state
-    this.state = { status: VoiceConnectionStatus.Destroyed }
-    this.emit('stateChange', oldState, this.state)
-    this.emit(VoiceConnectionStatus.Destroyed, oldState, this.state)
+  // Как VoiceConnection: выходит из канала и отписывает плеер, а пока соединение ещё не начато, ничего не делает
+  disconnect() {
+    if (
+      this.state.status === VoiceConnectionStatus.Destroyed ||
+      this.state.status === VoiceConnectionStatus.Signalling
+    ) {
+      return false
+    }
+
+    this.disconnects++
+    this.joinConfig.channelId = null
+    this.subscription?.unsubscribe()
+    this.setState({ status: VoiceConnectionStatus.Disconnected })
+    return true
   }
+
+  rejoin(config: FakeJoinConfig) {
+    if (this.state.status === VoiceConnectionStatus.Destroyed) {
+      return false
+    }
+
+    this.rejoins.push({ ...config })
+    Object.assign(this.joinConfig, config)
+    if (this.state.status !== VoiceConnectionStatus.Ready) {
+      this.setState({ status: VoiceConnectionStatus.Signalling })
+    }
+    return true
+  }
+
+  // Оборвался веб-сокет голосового сервера, и @discordjs/voice возобновляет прежнее соединение
+  resume() {
+    this.setState({ status: VoiceConnectionStatus.Connecting, networking: this.state.networking })
+  }
+
+  // Новое соединение с голосовым сервером готово
+  ready() {
+    this.setState({ status: VoiceConnectionStatus.Ready, networking: fakeNetworking() })
+  }
+
+  setState(newState: FakeConnectionState) {
+    const oldState = this.state
+    this.state = newState
+    this.emit('stateChange', oldState, newState)
+    if (oldState.status !== newState.status) {
+      this.emit(newState.status, oldState, newState)
+    }
+  }
+
+  destroy() {
+    this.setState({ status: VoiceConnectionStatus.Destroyed })
+  }
+}
+
+function fakeNetworking() {
+  const dave: FakeDave = { protocolVersion: 1, reinitializing: false, session: { ready: true } }
+  return { state: { code: NetworkingStatusCode.Ready, dave } }
 }
 
 // Ускоренные тайминги: проверка активности отключена, повторы и подтверждение старта — быстрые
@@ -198,6 +295,33 @@ export function readComponentsPanel(components: readonly unknown[] | undefined) 
 export function embedDescription(options: MessageEditOptions | undefined): string | undefined {
   const embeds = (options?.embeds ?? []) as unknown as readonly { toJSON(): { description?: string } }[]
   return embeds[0]?.toJSON().description
+}
+
+export interface LogLine {
+  level: 'info' | 'warn' | 'error'
+  line: string
+}
+
+/**
+ * Строки лога, выведенные за время теста: уровень логов на это время info, вывод в консоль подменён
+ */
+export function captureLogs(t: TestContext): LogLine[] {
+  const lines: LogLine[] = []
+  const level = config.logLevel
+  config.logLevel = 'info'
+  t.after(() => {
+    config.logLevel = level
+  })
+
+  const targets = [
+    ['log', 'info'],
+    ['warn', 'warn'],
+    ['error', 'error']
+  ] as const
+  for (const [method, logLevel] of targets) {
+    t.mock.method(console, method, (line: unknown) => lines.push({ level: logLevel, line: String(line) }))
+  }
+  return lines
 }
 
 export async function waitFor(predicate: () => boolean, label: string, timeout = 10_000): Promise<void> {

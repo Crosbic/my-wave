@@ -35,12 +35,14 @@ export const interactionCreate = {
       return
     }
 
-    logger.debug(`/${interaction.commandName} от ${interaction.user.tag}`)
+    // С меткой сервера, как у плеера: по ней команду видно рядом с тем, что она запустила
+    const log = interaction.guildId ? logger.child(`guild ${interaction.guildId}`) : logger
+    log.info(`/${interaction.commandName} от ${interaction.user.tag}`)
 
     try {
       await command.execute(interaction)
     } catch (error) {
-      logger.error(`Ошибка при выполнении команды /${interaction.commandName}`, error)
+      log.error(`Ошибка при выполнении команды /${interaction.commandName}`, error)
       await respond(interaction, 'Произошла ошибка при выполнении команды!')
     }
   }

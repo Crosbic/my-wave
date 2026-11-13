@@ -157,7 +157,7 @@ export class LoginService {
     const expiresAt = Date.now() + code.expiresIn * 1000
     const current = DatabaseService.getInstance().getUserData(userId)?.userInfo
     attempt.messageId = (await show(interaction, codeView(code, expiresAt, attempt, current)))?.id
-    log.debug(`Код для входа выдан: ${interaction.user.tag}`)
+    log.info(`Код для входа выдан: ${interaction.user.tag}`)
 
     while (Date.now() < expiresAt) {
       try {
@@ -192,7 +192,7 @@ export class LoginService {
       }
     }
 
-    log.debug(`Код для входа истёк: ${interaction.user.tag}`)
+    log.info(`Код для входа истёк: ${interaction.user.tag}`)
     await show(interaction, failedView('Код истёк. Получите новый, чтобы войти.', goal))
   }
 
@@ -224,6 +224,7 @@ export class LoginService {
       result = await YandexMusicService.getInstance().getUserInfo(tokens.accessToken)
     } catch (error) {
       if (error instanceof YandexAuthError) {
+        log.info(`Вход не выполнен: Яндекс не принял токен пользователя ${userId}`)
         return { ok: false, message: 'Токен недействителен или истёк.' }
       }
       log.error('Ошибка при авторизации', error)
@@ -235,6 +236,7 @@ export class LoginService {
 
     const { userInfo, hasPlus } = result
     if (!hasPlus) {
+      log.info(`Вход не выполнен: у пользователя ${userId} нет подписки Яндекс Плюс`)
       // Токен, который Яндекс выдал боту, без подписки не нужен: отзываем его, чтобы бот не оставался в Яндекс ID
       if (tokens.refreshToken) {
         await this.revoke(tokens.accessToken)
@@ -251,6 +253,9 @@ export class LoginService {
     db.saveUserToken(userId, tokens, userInfo)
     // Прежний токен того же аккаунта после входа может перестать работать, поэтому плееры пользователя переходят на новый
     PlayerService.getInstance().updateOwnerToken(userId, userInfo.id, tokens.accessToken)
+    log.info(
+      `Вход выполнен: пользователь ${userId}, аккаунт Яндекса ${userInfo.id}, ${tokens.refreshToken ? 'по коду' : 'по токену'}`
+    )
 
     return { ok: true, name: escapeMarkdown(userInfo.nickName), wasAuthorized }
   }

@@ -1,3 +1,5 @@
+import { DiscordAPIError } from 'discord.js'
+
 import { isAxiosError } from 'axios'
 
 const MAX_BODY_LENGTH = 300
@@ -10,6 +12,13 @@ export class UserFacingError extends Error {
     super(message)
     this.name = 'UserFacingError'
   }
+}
+
+/**
+ * Ошибка API Discord с одним из кодов, например RESTJSONErrorCodes.UnknownMessage
+ */
+export function isDiscordError(error: unknown, ...codes: number[]): boolean {
+  return error instanceof DiscordAPIError && typeof error.code === 'number' && codes.includes(error.code)
 }
 
 /**

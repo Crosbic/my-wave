@@ -8,7 +8,7 @@ import { describe, it } from 'node:test'
 import axios, { AxiosError, AxiosHeaders, AxiosInstance, InternalAxiosRequestConfig, isAxiosError } from 'axios'
 
 import { YandexAuthError } from '../src/errors/yandexAuthError.js'
-import { retryOnRateLimit, YandexMusicService } from '../src/services/yandex-music.service.js'
+import { retryOnRateLimit, retryOnTransientError, YandexMusicService } from '../src/services/yandex-music.service.js'
 
 interface Request {
   method: 'get' | 'post'
@@ -318,6 +318,30 @@ describe('YandexMusicService', () => {
     assert.equal(await client.openTrackStream('token', '1'), null, 'ссылку на файл получить не удалось')
   })
 
+  it('если связь с хранилищем оборвалась, загрузка аудиофайла повторяется', async t => {
+    let attempts = 0
+    const server = http.createServer((_req, res) => {
+      // Первое соединение рвётся до ответа, как при сбое сети
+      if (++attempts === 1) {
+        res.socket?.destroy()
+        return
+      }
+      res.writeHead(200, { 'content-type': 'audio/mpeg' })
+      res.end('mp3-bytes')
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', () => resolve()))
+    t.after(() => {
+      server.closeAllConnections()
+      server.close()
+    })
+
+    const { client } = createClient(() => ({}))
+    t.mock.method(client, 'getStreamUrl', async () => `http://127.0.0.1:${(server.address() as AddressInfo).port}/`)
+
+    assert.equal(await readText(await client.openTrackStream('token', '1')), 'mp3-bytes')
+    assert.equal(attempts, 2)
+  })
+
   it('лайк отправляет поле track-ids', async () => {
     const { client, requests } = createClient(() => ({ result: { revision: 1 } }))
 
@@ -420,5 +444,63 @@ describe('повтор запросов при 429', () => {
 
     assert.equal(requests.length, 2)
     assert.ok(Date.now() - start < 2_000, 'без Retry-After пауза была бы 5 секунд')
+  })
+})
+
+/**
+ * Клиент axios с повтором при сбоях, но вместо сети — адаптер, который сначала отвечает заданными сбоями,
+ * а потом 200. network — соединение оборвалось без ответа
+ */
+function flakyClient(failures: (number | 'network')[]) {
+  const requests: string[] = []
+  const http = axios.create({
+    adapter: async (config: InternalAxiosRequestConfig) => {
+      requests.push(`${config.method} ${config.url}`)
+      const failure = failures.shift()
+      if (failure === 'network') {
+        throw new AxiosError('socket hang up', 'ECONNRESET', config)
+      }
+
+      const status = failure ?? 200
+      const response = { status, statusText: '', headers: {}, config, data: {} }
+      if (status >= 400) {
+        throw new AxiosError(`HTTP ${status}`, 'ERR_BAD_RESPONSE', config, {}, response)
+      }
+      return response
+    }
+  })
+  retryOnTransientError(http, { delay: 1 })
+  return { http, requests }
+}
+
+describe('повтор запросов при сбоях сети', () => {
+  it('GET повторяется, если соединение оборвалось или сервер ответил 5xx', async () => {
+    const dropped = flakyClient(['network'])
+    assert.equal((await dropped.http.get('/tracks/1/download-info')).status, 200)
+    assert.equal(dropped.requests.length, 2)
+
+    const unavailable = flakyClient([503])
+    assert.equal((await unavailable.http.get('/tracks/1/download-info')).status, 200)
+    assert.equal(unavailable.requests.length, 2)
+  })
+
+  it('повтор один: если сбой повторился, запрос завершается ошибкой', async () => {
+    const { http, requests } = flakyClient([503, 503])
+
+    await assert.rejects(
+      http.get('/tracks/1/download-info'),
+      (error: unknown) => isAxiosError(error) && error.response?.status === 503
+    )
+    assert.equal(requests.length, 2)
+  })
+
+  it('POST и ошибки запроса не повторяются', async () => {
+    const created = flakyClient([503])
+    await assert.rejects(created.http.post('/rotor/session/new', {}))
+    assert.equal(created.requests.length, 1, 'новая сессия волны задвоилась бы')
+
+    const missing = flakyClient([404])
+    await assert.rejects(missing.http.get('/tracks/1/download-info'))
+    assert.equal(missing.requests.length, 1)
   })
 })

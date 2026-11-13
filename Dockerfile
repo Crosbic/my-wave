@@ -12,6 +12,8 @@ RUN yarn build
 FROM node:24-bookworm
 
 ENV NODE_ENV=production
+# В контейнере вывод не терминал, и цвет уровней в логах включаем явно: консоль логов Portainer его показывает
+ENV LOG_COLORS=true
 
 WORKDIR /app
 

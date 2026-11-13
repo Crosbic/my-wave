@@ -116,6 +116,7 @@ export class PlayerService {
         }
       })
       this.sessions.set(guildId, session)
+      logger.child(`guild ${guildId}`).info(`Плеер запущен: ${user.tag}, канал «${voiceChannel.name}»`)
 
       if (!(await session.start())) {
         throw session.tokenRejected

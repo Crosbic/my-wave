@@ -26,17 +26,26 @@ import {
   joinVoiceChannel,
   NoSubscriberBehavior,
   VoiceConnection,
+  VoiceConnectionState,
   VoiceConnectionStatus
 } from '@discordjs/voice'
 
 import { createTrackResource, discard } from './track-resource.js'
+import {
+  describeConnectionState,
+  isDaveActive,
+  isMissedTransition,
+  isResuming,
+  logDaveMessage,
+  voiceProblem
+} from './voice-health.js'
 import { describeChoice, isDefaultChoice, waveSeeds } from './wave-settings.js'
 import { WaveFeedback, YandexMusicService } from './yandex-music.service.js'
 import { YandexAuthError } from '../errors/yandexAuthError.js'
 import { WaveChoice } from '../types/waveSettings.js'
 import { IStationBatch, IWaveSession, IYandexTrack } from '../types/yandexTrack.js'
 import { UserFacingError } from '../utils/errors.js'
-import { Logger, logger } from '../utils/logger.js'
+import { Logger, logger, MessageLevel } from '../utils/logger.js'
 
 const VOLUME = 0.8 // Чтоб не оглохли
 // Пять страниц «📜 Истории»
@@ -48,6 +57,9 @@ const MAX_TRACK_ATTEMPTS = 3
 // Сколько треков подряд может не воспроизвестись, прежде чем плеер остановится
 const MAX_FAILED_TRACKS = 5
 const BATCH_ATTEMPTS = 3
+// Сколько раз за RECONNECT_WINDOW плеер может зайти в канал заново: если чаще, соединение явно не держится
+const MAX_RECONNECTS = 5
+const RECONNECT_WINDOW = 10 * 60_000
 
 /**
  * Задержки и таймауты сессии в миллисекундах
@@ -64,6 +76,9 @@ export interface WaveTimings {
   retryDelay: number
   // Через сколько после старта проверяем, что звук действительно пошёл: битый поток тоже ненадолго переходит в Playing
   startConfirmDelay: number
+  // Сколько соединение может не восстанавливаться, а сквозное шифрование — быть не готово, прежде чем бот зайдёт
+  // в канал заново. Дольше окна смены ключей DAVE в 10 секунд
+  voiceStallTimeout: number
 }
 
 export const DEFAULT_TIMINGS: WaveTimings = {
@@ -75,7 +90,8 @@ export const DEFAULT_TIMINGS: WaveTimings = {
   pauseTimeout: 10 * 60_000,
   retryWindow: 10_000,
   retryDelay: 2_000,
-  startConfirmDelay: 1_000
+  startConfirmDelay: 1_000,
+  voiceStallTimeout: 15_000
 }
 
 const COLOR_PLAYING = '#FFCC00'
@@ -136,6 +152,8 @@ export class WaveSession {
   private readonly timings: WaveTimings
   private readonly log: Logger
   private readonly activityTimer: NodeJS.Timeout
+  // Прерывает ожидания сессии, когда её останавливают
+  private readonly lifetime = new AbortController()
 
   private message: Message | null
   private choice: WaveChoice
@@ -163,6 +181,11 @@ export class WaveSession {
   private emptySince: number | null = null
   private pausedSince: number | null = null
   private idleSince: number | null = null
+  private voiceProblemSince: number | null = null
+
+  private reconnecting = false
+  // Когда бот заходил в канал заново: не чаще MAX_RECONNECTS раз за RECONNECT_WINDOW
+  private reconnects: number[] = []
 
   /**
    * Сессия поверх уже подключённого голосового соединения и отправленного сообщения.
@@ -187,13 +210,13 @@ export class WaveSession {
     this.player.on('error', error => this.onPlayerError(error))
     connection.subscribe(this.player)
 
-    connection.on('stateChange', (oldState, newState) => {
-      if (oldState.status !== newState.status) {
-        this.log.debug(`Соединение: ${oldState.status} -> ${newState.status}`)
-      }
-    })
+    connection.on('stateChange', (oldState, newState) => this.onConnectionStateChange(oldState, newState))
+    connection.on('debug', message => this.onConnectionDebug(message))
     connection.on(VoiceConnectionStatus.Disconnected, () => void this.onDisconnected())
-    connection.on(VoiceConnectionStatus.Destroyed, () => void this.destroy('Бот отключён от голосового канала.'))
+    connection.on(
+      VoiceConnectionStatus.Destroyed,
+      () => void this.destroy('Бот отключён от голосового канала.', 'warn')
+    )
     connection.on('error', error => this.log.error('Ошибка соединения', error))
 
     this.activityTimer = setInterval(() => this.checkActivity(), this.timings.activityCheckInterval)
@@ -211,8 +234,12 @@ export class WaveSession {
     const connection = joinVoiceChannel({
       channelId: voiceChannel.id,
       guildId,
-      adapterCreator: voiceChannel.guild.voiceAdapterCreator
+      adapterCreator: voiceChannel.guild.voiceAdapterCreator,
+      // Ради сообщений DAVE в логе, остальные отладочные сообщения не выводим
+      debug: true
     })
+    // С самого подключения: первые сообщения DAVE приходят раньше, чем появляется сессия
+    connection.on('debug', message => logDaveMessage(log, message))
 
     try {
       await entersState(connection, VoiceConnectionStatus.Ready, connectTimeout)
@@ -415,18 +442,20 @@ export class WaveSession {
 
   /**
    * Остановка плеера и освобождение ресурсов. Повторные вызовы ничего не делают.
+   * level — уровень записи в логе: обычная остановка — info, сбой — warn или error.
    * Промис завершается, когда сообщение плеера обновлено
    */
-  destroy(reason: string): Promise<void> {
+  destroy(reason: string, level: MessageLevel = 'info'): Promise<void> {
     if (this.destroyed) {
       return this.renderQueue
     }
 
     this.destroyed = true
     this.endReason = reason
-    this.log.info(`Плеер остановлен: ${reason}`)
+    this.log[level](`Плеер остановлен: ${reason}`)
 
     clearInterval(this.activityTimer)
+    this.lifetime.abort()
     this.player.stop(true)
     destroyConnection(this.connection)
     this.onDestroy(this)
@@ -451,11 +480,12 @@ export class WaveSession {
         if (error instanceof YandexAuthError) {
           this.rejectedToken = true
           void this.destroy(
-            'Токен Яндекса владельца плеера недействителен или истёк. Владельцу нужно войти заново командой `/login`.'
+            'Токен Яндекса владельца плеера недействителен или истёк. Владельцу нужно войти заново командой `/login`.',
+            'warn'
           )
         } else {
           this.log.error('Ошибка плеера', error)
-          void this.destroy('Произошла ошибка плеера.')
+          void this.destroy('Произошла ошибка плеера.', 'error')
         }
       } finally {
         this.busy = false
@@ -486,7 +516,7 @@ export class WaveSession {
 
     while (!this.destroyed) {
       if (this.failedTracks >= MAX_FAILED_TRACKS) {
-        void this.destroy('Не удалось воспроизвести несколько треков подряд.')
+        void this.destroy('Не удалось воспроизвести несколько треков подряд.', 'error')
         return
       }
 
@@ -495,7 +525,7 @@ export class WaveSession {
         return
       }
       if (!next) {
-        void this.destroy('Не удалось загрузить треки «Моей волны».')
+        void this.destroy('Не удалось загрузить треки «Моей волны».', 'error')
         return
       }
       if (await this.play(next)) {
@@ -562,7 +592,7 @@ export class WaveSession {
         if (error instanceof YandexAuthError) {
           throw error
         }
-        this.log.error(`Не удалось загрузить треки волны (попытка ${attempt}/${BATCH_ATTEMPTS})`, error)
+        this.log.warn(`Не удалось загрузить треки волны (попытка ${attempt}/${BATCH_ATTEMPTS})`, error)
       }
 
       if (attempt < BATCH_ATTEMPTS) {
@@ -726,7 +756,89 @@ export class WaveSession {
     )
   }
 
+  private onConnectionStateChange(oldState: VoiceConnectionState, newState: VoiceConnectionState): void {
+    // Остановку плеера в логе уже видно по «Плеер остановлен»
+    if (oldState.status !== newState.status && newState.status !== VoiceConnectionStatus.Destroyed) {
+      this.log.info(`Голосовое соединение: ${oldState.status} -> ${describeConnectionState(newState)}`)
+    }
+
+    // При обрыве веб-сокета голосовой сервер исключает бота из группы сквозного шифрования (DAVE), а @discordjs/voice 0.19
+    // возобновляет соединение, не возвращая бота в группу: плеер играет, но расшифровать звук бота никто не может
+    if (isResuming(oldState, newState)) {
+      this.reconnectSoon('оборвалась связь с голосовым сервером')
+    }
+  }
+
+  private onConnectionDebug(message: string): void {
+    // Пока бот не в группе шифрования, смены ключей между остальными участниками его не касаются
+    if (isMissedTransition(message) && isDaveActive(this.connection)) {
+      this.reconnectSoon('пропущена смена ключей сквозного шифрования (DAVE)')
+    }
+  }
+
+  /**
+   * Переподключение после текущего события соединения: оно само меняет состояние соединения
+   */
+  private reconnectSoon(reason: string): void {
+    queueMicrotask(() => void this.reconnect(reason))
+  }
+
+  /**
+   * Бот заходит в канал заново, как после ⏹️ и /my-wave, но с тем же треком и очередью: пока соединения нет,
+   * плеер на паузе, а потом продолжает трек с того же места
+   */
+  private async reconnect(reason: string): Promise<void> {
+    if (this.destroyed || this.reconnecting) {
+      return
+    }
+
+    const now = Date.now()
+    this.reconnects = this.reconnects.filter(time => now - time < RECONNECT_WINDOW)
+    if (this.reconnects.length >= MAX_RECONNECTS) {
+      void this.destroy('Соединение с голосовым каналом постоянно обрывается.', 'error')
+      return
+    }
+
+    const { channelId, selfDeaf, selfMute } = this.connection.joinConfig
+    if (!channelId) {
+      void this.destroy('Соединение с голосовым каналом потеряно.', 'warn')
+      return
+    }
+
+    this.reconnects.push(now)
+    this.reconnecting = true
+    this.log.warn(`Заходим в голосовой канал заново: ${reason}`)
+    try {
+      // disconnect() закрывает соединение с голосовым сервером, а в Signalling его ещё нет, и disconnect() ничего не делает:
+      // тогда только выходим из канала. Заодно disconnect() отписывает плеер от соединения, поэтому подписываем его снова
+      if (!this.connection.disconnect()) {
+        this.connection.rejoin({ channelId: null, selfDeaf, selfMute })
+      }
+      if (!this.connection.rejoin({ channelId, selfDeaf, selfMute })) {
+        throw new Error('Шлюз Discord недоступен')
+      }
+      this.connection.subscribe(this.player)
+
+      const timeout = AbortSignal.timeout(this.timings.connectTimeout)
+      await entersState(this.connection, VoiceConnectionStatus.Ready, AbortSignal.any([this.lifetime.signal, timeout]))
+      this.log.info('Голосовое соединение восстановлено')
+    } catch (error) {
+      if (!this.destroyed) {
+        this.log.error('Не удалось зайти в голосовой канал заново', error)
+        void this.destroy('Соединение с голосовым каналом потеряно.', 'error')
+      }
+    } finally {
+      this.reconnecting = false
+      this.voiceProblemSince = null
+    }
+  }
+
   private async onDisconnected(): Promise<void> {
+    // Бот сам вышел из канала, чтобы зайти заново
+    if (this.reconnecting) {
+      return
+    }
+
     try {
       // Переподключение (например, бота перенесли в другой канал) начнётся само, если это не окончательное отключение
       await Promise.race([
@@ -735,7 +847,7 @@ export class WaveSession {
       ])
       this.log.info('Соединение восстанавливается...')
     } catch {
-      void this.destroy('Соединение с голосовым каналом потеряно.')
+      void this.destroy('Соединение с голосовым каналом потеряно.', 'warn')
     }
   }
 
@@ -745,9 +857,10 @@ export class WaveSession {
     }
 
     const now = Date.now()
-    const { emptyChannelTimeout, pauseTimeout, noPlaybackTimeout } = this.timings
+    const { emptyChannelTimeout, pauseTimeout, noPlaybackTimeout, voiceStallTimeout } = this.timings
 
-    this.emptySince = this.countListeners() === 0 ? (this.emptySince ?? now) : null
+    const listeners = this.countListeners()
+    this.emptySince = listeners === 0 ? (this.emptySince ?? now) : null
     if (this.emptySince !== null && now - this.emptySince >= emptyChannelTimeout) {
       void this.destroy('Все пользователи покинули голосовой канал.')
       return
@@ -762,7 +875,15 @@ export class WaveSession {
 
     this.idleSince = status === AudioPlayerStatus.Idle && !this.busy ? (this.idleSince ?? now) : null
     if (this.idleSince !== null && now - this.idleSince >= noPlaybackTimeout) {
-      void this.destroy('Нет активного воспроизведения музыки.')
+      void this.destroy('Нет активного воспроизведения музыки.', 'warn')
+      return
+    }
+
+    // Плеер может играть, когда бота не слышно: соединение не восстанавливается или не готово шифрование
+    const problem = listeners && !this.reconnecting ? voiceProblem(this.connection) : null
+    this.voiceProblemSince = problem ? (this.voiceProblemSince ?? now) : null
+    if (problem && this.voiceProblemSince !== null && now - this.voiceProblemSince >= voiceStallTimeout) {
+      void this.reconnect(problem)
     }
   }
 

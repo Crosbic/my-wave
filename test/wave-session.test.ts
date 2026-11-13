@@ -6,8 +6,11 @@ import { setTimeout as sleep } from 'timers/promises'
 
 import { MessageEditOptions } from 'discord.js'
 
+import { VoiceConnectionStatus } from '@discordjs/voice'
+
 import {
   buttons,
+  captureLogs,
   createTestSession,
   embedDescription,
   FAST_TIMINGS,
@@ -20,7 +23,7 @@ import {
   writeSilentWav
 } from './helpers.js'
 import { YandexAuthError } from '../src/errors/yandexAuthError.js'
-import { WaveSession } from '../src/services/wave-session.js'
+import { WaveSession, WaveTimings } from '../src/services/wave-session.js'
 import { WaveFeedback, YandexMusicService } from '../src/services/yandex-music.service.js'
 import { WaveChoice } from '../src/types/waveSettings.js'
 import { IStationBatch, IYandexTrack } from '../src/types/yandexTrack.js'
@@ -107,8 +110,8 @@ function slowLongClip(t: TestContext) {
   })
 }
 
-function startedSession(t: TestContext, choice: WaveChoice = {}) {
-  const test = createTestSession(FAST_TIMINGS, choice)
+function startedSession(t: TestContext, choice: WaveChoice = {}, timings: Partial<WaveTimings> = {}) {
+  const test = createTestSession({ ...FAST_TIMINGS, ...timings }, choice)
   t.after(() => test.session.destroy('Конец теста'))
   return test
 }
@@ -551,6 +554,26 @@ describe('WaveSession', () => {
     assert.match(session.stopReason ?? '', /Не удалось загрузить треки/)
   })
 
+  it('обычная остановка плеера в логе — info, а сбой — error', async t => {
+    const logs = captureLogs(t)
+    const stops = () => logs.filter(({ line }) => line.includes('Плеер остановлен')).map(({ level }) => level)
+
+    await startedSession(t).session.destroy('Плеер был остановлен.')
+    assert.deepEqual(stops(), ['info'])
+
+    stubYandex(t, {
+      nextBatch: async () => {
+        throw new Error('ECONNRESET')
+      }
+    })
+    assert.equal(await startedSession(t).session.start(), false)
+    assert.deepEqual(stops(), ['info', 'error'])
+    assert.ok(
+      logs.some(({ level, line }) => level === 'warn' && line.includes('попытка 1/3')),
+      'попытка, после которой будет следующая, — только предупреждение'
+    )
+  })
+
   it('destroy освобождает ресурсы и больше не трогает сообщение', async t => {
     const yandexStub = stubYandex(t, { batches: [batch('b1', '11')], clip: 'long' })
     const { session, connection, edits, isDestroyed } = startedSession(t)
@@ -581,5 +604,101 @@ describe('WaveSession', () => {
     await waitForStart(session, yandexStub.started, '12')
     await session.destroy('Плеер был остановлен.')
     await waitFor(() => runningProcesses() === 0, 'ffmpeg завершился вместе с плеером')
+  })
+})
+
+describe('WaveSession: голосовое соединение', () => {
+  // Соединение и шифрование проверяются часто, а зависшими считаются быстро
+  const WATCHED: Partial<WaveTimings> = { activityCheckInterval: 50, voiceStallTimeout: 300 }
+  const MISSED_TRANSITION = "[NW] [DAVE] Received execute transition, but we don't have a pending transition for 5"
+
+  async function playingSession(t: TestContext, timings: Partial<WaveTimings> = {}) {
+    const yandexStub = stubYandex(t, { batches: [batch('b1', '11', '12')], clip: 'long' })
+    const test = startedSession(t, {}, timings)
+    await test.session.start()
+    await waitForStart(test.session, yandexStub.started, '11')
+    return test
+  }
+
+  it('после обрыва связи с голосовым сервером бот заходит в канал заново, а трек играет дальше', async t => {
+    const { session, connection, isDestroyed } = await playingSession(t)
+
+    connection.resume()
+    await waitFor(() => connection.rejoins.length === 1, 'бот зашёл в канал заново')
+    assert.equal(connection.disconnects, 1, 'сначала бот вышел из канала')
+    assert.deepEqual(connection.rejoins, [{ channelId: 'voice-1', selfDeaf: true, selfMute: false }])
+    await waitFor(() => playerStatus(session) === 'autopaused', 'пока соединения нет, трек на паузе')
+
+    connection.ready()
+    await waitFor(() => playerStatus(session) === 'playing', 'трек играет дальше')
+    assert.equal(session.currentTrack?.id, '11', 'тот же трек, а не следующий')
+    assert.ok(!isDestroyed())
+  })
+
+  it('если зайти в канал заново не удалось, плеер останавливается с понятной причиной', async t => {
+    const { session, connection, isDestroyed } = await playingSession(t, { connectTimeout: 300 })
+
+    connection.resume()
+    await waitFor(isDestroyed, 'плеер остановлен')
+    assert.equal(session.stopReason, 'Соединение с голосовым каналом потеряно.')
+  })
+
+  it('если сквозное шифрование долго не готово, бот заходит в канал заново', async t => {
+    const { connection } = await playingSession(t, WATCHED)
+
+    // При смене ключей шифрование ненадолго не готово, это не сбой
+    connection.dave.session.ready = false
+    await sleep(150)
+    connection.dave.session.ready = true
+    await sleep(450)
+    assert.equal(connection.rejoins.length, 0)
+
+    connection.dave.reinitializing = true
+    await waitFor(() => connection.rejoins.length === 1, 'бот зашёл в канал заново')
+  })
+
+  it('если бот пропустил смену ключей шифрования, он заходит в канал заново', async t => {
+    const { connection } = await playingSession(t)
+
+    // Пока бот не в группе шифрования, смены ключей между остальными участниками его не касаются
+    connection.dave.session.ready = false
+    connection.emit('debug', MISSED_TRANSITION)
+    await sleep(100)
+    assert.equal(connection.rejoins.length, 0)
+
+    connection.dave.session.ready = true
+    connection.emit('debug', MISSED_TRANSITION)
+    await waitFor(() => connection.rejoins.length === 1, 'бот зашёл в канал заново')
+  })
+
+  it('если соединение не восстанавливается само, бот выходит из канала и заходит снова', async t => {
+    const { session, connection } = await playingSession(t, WATCHED)
+
+    // После обрыва @discordjs/voice попросил Discord подключить бота заново, но ответа нет
+    connection.setState({ status: VoiceConnectionStatus.Signalling })
+    await waitFor(() => connection.rejoins.length === 2, 'бот зашёл в канал заново')
+    assert.deepEqual(
+      connection.rejoins.map(config => config.channelId),
+      [null, 'voice-1']
+    )
+
+    connection.ready()
+    await waitFor(() => playerStatus(session) === 'playing', 'трек играет дальше')
+  })
+
+  it('если соединение обрывается раз за разом, плеер останавливается', async t => {
+    const { session, connection, isDestroyed } = await playingSession(t)
+
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      connection.resume()
+      await waitFor(() => connection.rejoins.length === attempt, `бот зашёл в канал заново (${attempt})`)
+      connection.ready()
+      await waitFor(() => playerStatus(session) === 'playing', `трек играет дальше (${attempt})`)
+    }
+
+    connection.resume()
+    await waitFor(isDestroyed, 'плеер остановлен')
+    assert.equal(session.stopReason, 'Соединение с голосовым каналом постоянно обрывается.')
+    assert.equal(connection.rejoins.length, 5)
   })
 })
