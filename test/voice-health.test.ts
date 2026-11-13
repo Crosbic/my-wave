@@ -9,7 +9,13 @@ import {
 } from '@discordjs/voice'
 
 import { FakeVoiceConnection } from './helpers.js'
-import { daveDebugMessage, describeConnectionState, voiceProblem } from '../src/services/voice-health.js'
+import {
+  daveDebugMessage,
+  describeConnectionState,
+  discoverVoiceAddress,
+  isVoiceSocketStalled,
+  voiceProblem
+} from '../src/services/voice-health.js'
 
 describe('voice-health', () => {
   it('из отладочного лога соединения берутся только сообщения DAVE: в остальных токен и ключ шифрования', () => {
@@ -42,5 +48,35 @@ describe('voice-health', () => {
       closeCode: 4014
     } as unknown as VoiceConnectionState
     assert.equal(describeConnectionState(state), 'disconnected (WebSocketClose, код 4014)')
+  })
+})
+
+describe('voice-health: адрес бота у голосового сервера', () => {
+  it('узнаётся тем же запросом IP discovery, что и при подключении', async () => {
+    const connection = new FakeVoiceConnection()
+    const discover = () => discoverVoiceAddress(connection as unknown as VoiceConnection, 100)
+
+    assert.equal(await discover(), '203.0.113.10:50001')
+
+    connection.udp.address = null
+    assert.equal(await discover(), null, 'сервер не ответил')
+
+    connection.resume()
+    assert.equal(await discover(), null, 'соединение не готово')
+  })
+})
+
+describe('voice-health: зависший веб-сокет голосового соединения', () => {
+  it('завис, если ответа на heartbeat нет дольше таймаута', () => {
+    const connection = new FakeVoiceConnection()
+    const stalled = (now: number) => isVoiceSocketStalled(connection as unknown as VoiceConnection, 5_000, now)
+    assert.equal(stalled(10_000), false, 'heartbeat ещё не отправлялся')
+
+    connection.ws.lastHeartbeatSend = 10_000
+    assert.equal(stalled(14_000), false, 'ответа пока нет, но время не вышло')
+    assert.equal(stalled(16_000), true)
+
+    connection.ws.lastHeartbeatAck = 10_200
+    assert.equal(stalled(16_000), false, 'ответ пришёл')
   })
 })

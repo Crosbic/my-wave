@@ -33,9 +33,11 @@ import {
 import { createTrackResource, discard } from './track-resource.js'
 import {
   describeConnectionState,
+  discoverVoiceAddress,
   isDaveActive,
   isMissedTransition,
   isResuming,
+  isVoiceSocketStalled,
   logDaveMessage,
   voiceProblem
 } from './voice-health.js'
@@ -60,6 +62,8 @@ const BATCH_ATTEMPTS = 3
 // Сколько раз за RECONNECT_WINDOW плеер может зайти в канал заново: если чаще, соединение явно не держится
 const MAX_RECONNECTS = 5
 const RECONNECT_WINDOW = 10 * 60_000
+// Сколько раз подряд голосовой сервер может не ответить на проверку адреса, прежде чем она отключится до следующего соединения
+const UDP_CHECK_ATTEMPTS = 3
 
 /**
  * Задержки и таймауты сессии в миллисекундах
@@ -79,19 +83,33 @@ export interface WaveTimings {
   // Сколько соединение может не восстанавливаться, а сквозное шифрование — быть не готово, прежде чем бот зайдёт
   // в канал заново. Дольше окна смены ключей DAVE в 10 секунд
   voiceStallTimeout: number
+  // Как часто сверяем адрес, с которого голосовой сервер получает звук бота, и сколько ждём ответа
+  udpCheckInterval: number
+  udpCheckTimeout: number
+  // Сколько голосовой сервер может не отвечать на heartbeat, прежде чем бот зайдёт в канал заново
+  heartbeatTimeout: number
+  // Сколько бот пытается зайти в канал заново, прежде чем остановить плеер, и пауза между попытками
+  voiceRecoveryTimeout: number
+  rejoinDelay: number
 }
 
 export const DEFAULT_TIMINGS: WaveTimings = {
   connectTimeout: 20_000,
   reconnectTimeout: 5_000,
-  activityCheckInterval: 5_000,
+  // Часто, чтобы зависшее голосовое соединение замечалось быстро
+  activityCheckInterval: 2_000,
   emptyChannelTimeout: 20_000,
   noPlaybackTimeout: 30_000,
   pauseTimeout: 10 * 60_000,
   retryWindow: 10_000,
   retryDelay: 2_000,
   startConfirmDelay: 1_000,
-  voiceStallTimeout: 15_000
+  voiceStallTimeout: 15_000,
+  udpCheckInterval: 15_000,
+  udpCheckTimeout: 3_000,
+  heartbeatTimeout: 5_000,
+  voiceRecoveryTimeout: 3 * 60_000,
+  rejoinDelay: 5_000
 }
 
 const COLOR_PLAYING = '#FFCC00'
@@ -152,6 +170,7 @@ export class WaveSession {
   private readonly timings: WaveTimings
   private readonly log: Logger
   private readonly activityTimer: NodeJS.Timeout
+  private readonly udpCheckTimer: NodeJS.Timeout
   // Прерывает ожидания сессии, когда её останавливают
   private readonly lifetime = new AbortController()
 
@@ -187,6 +206,10 @@ export class WaveSession {
   // Когда бот заходил в канал заново: не чаще MAX_RECONNECTS раз за RECONNECT_WINDOW
   private reconnects: number[] = []
 
+  // Адрес, с которого голосовой сервер получает звук бота в текущем соединении с ним
+  private udpCheck: { networking: unknown; address: string | null; misses: number } | null = null
+  private checkingUdp = false
+
   /**
    * Сессия поверх уже подключённого голосового соединения и отправленного сообщения.
    * В боте используйте WaveSession.create: он подключается к каналу и отправляет сообщение сам
@@ -220,6 +243,7 @@ export class WaveSession {
     connection.on('error', error => this.log.error('Ошибка соединения', error))
 
     this.activityTimer = setInterval(() => this.checkActivity(), this.timings.activityCheckInterval)
+    this.udpCheckTimer = setInterval(() => void this.checkVoiceAddress(), this.timings.udpCheckInterval)
   }
 
   /**
@@ -455,6 +479,7 @@ export class WaveSession {
     this.log[level](`Плеер остановлен: ${reason}`)
 
     clearInterval(this.activityTimer)
+    clearInterval(this.udpCheckTimer)
     this.lifetime.abort()
     this.player.stop(true)
     destroyConnection(this.connection)
@@ -809,27 +834,56 @@ export class WaveSession {
     this.reconnecting = true
     this.log.warn(`Заходим в голосовой канал заново: ${reason}`)
     try {
-      // disconnect() закрывает соединение с голосовым сервером, а в Signalling его ещё нет, и disconnect() ничего не делает:
-      // тогда только выходим из канала. Заодно disconnect() отписывает плеер от соединения, поэтому подписываем его снова
-      if (!this.connection.disconnect()) {
-        this.connection.rejoin({ channelId: null, selfDeaf, selfMute })
-      }
-      if (!this.connection.rejoin({ channelId, selfDeaf, selfMute })) {
-        throw new Error('Шлюз Discord недоступен')
-      }
-      this.connection.subscribe(this.player)
+      // Если маршрут VPN умер, вместе с голосовым соединением завис и шлюз Discord: запрос на вход в канал теряется
+      // или не уходит, пока шлюз не переподключится. Поэтому пробуем снова, пока не выйдет время
+      const deadline = now + this.timings.voiceRecoveryTimeout
+      for (let attempt = 1; !(await this.tryRejoin({ channelId, selfDeaf, selfMute })); attempt++) {
+        if (this.destroyed) {
+          return
+        }
+        if (Date.now() >= deadline) {
+          this.log.error(`Не удалось зайти в голосовой канал заново, попыток: ${attempt}`)
+          void this.destroy('Соединение с голосовым каналом потеряно.', 'error')
+          return
+        }
 
-      const timeout = AbortSignal.timeout(this.timings.connectTimeout)
-      await entersState(this.connection, VoiceConnectionStatus.Ready, AbortSignal.any([this.lifetime.signal, timeout]))
+        this.log.warn(`Не удалось зайти в голосовой канал (попытка ${attempt}), пробуем снова`)
+        await sleep(this.timings.rejoinDelay, undefined, { signal: this.lifetime.signal })
+      }
       this.log.info('Голосовое соединение восстановлено')
     } catch (error) {
+      // Пауза между попытками прерывается, когда плеер останавливают
       if (!this.destroyed) {
-        this.log.error('Не удалось зайти в голосовой канал заново', error)
+        this.log.error('Ошибка при входе в голосовой канал заново', error)
         void this.destroy('Соединение с голосовым каналом потеряно.', 'error')
       }
     } finally {
       this.reconnecting = false
       this.voiceProblemSince = null
+    }
+  }
+
+  /**
+   * Одна попытка выйти из канала и зайти снова. true — соединение готово
+   */
+  private async tryRejoin(config: { channelId: string; selfDeaf: boolean; selfMute: boolean }): Promise<boolean> {
+    // disconnect() закрывает соединение с голосовым сервером, а в Signalling его ещё нет, и disconnect() ничего не делает:
+    // тогда только выходим из канала. Заодно disconnect() отписывает плеер от соединения, поэтому подписываем его снова
+    if (!this.connection.disconnect()) {
+      this.connection.rejoin({ ...config, channelId: null })
+    }
+    // Шлюз Discord переподключается, и запрос не отправлен
+    if (!this.connection.rejoin(config)) {
+      return false
+    }
+    this.connection.subscribe(this.player)
+
+    try {
+      const timeout = AbortSignal.timeout(this.timings.connectTimeout)
+      await entersState(this.connection, VoiceConnectionStatus.Ready, AbortSignal.any([this.lifetime.signal, timeout]))
+      return true
+    } catch {
+      return false
     }
   }
 
@@ -857,7 +911,7 @@ export class WaveSession {
     }
 
     const now = Date.now()
-    const { emptyChannelTimeout, pauseTimeout, noPlaybackTimeout, voiceStallTimeout } = this.timings
+    const { emptyChannelTimeout, pauseTimeout, noPlaybackTimeout, voiceStallTimeout, heartbeatTimeout } = this.timings
 
     const listeners = this.countListeners()
     this.emptySince = listeners === 0 ? (this.emptySince ?? now) : null
@@ -879,11 +933,68 @@ export class WaveSession {
       return
     }
 
+    // Голосовой сервер не ответил на heartbeat: соединение зависло, например на умершем маршруте VPN.
+    // @discordjs/voice закроет его только после трёх пропущенных heartbeat, почти через минуту тишины
+    if (listeners && !this.reconnecting && isVoiceSocketStalled(this.connection, heartbeatTimeout, now)) {
+      void this.reconnect(`голосовой сервер не отвечает на heartbeat дольше ${heartbeatTimeout / 1000} с`)
+      return
+    }
+
     // Плеер может играть, когда бота не слышно: соединение не восстанавливается или не готово шифрование
     const problem = listeners && !this.reconnecting ? voiceProblem(this.connection) : null
     this.voiceProblemSince = problem ? (this.voiceProblemSince ?? now) : null
     if (problem && this.voiceProblemSince !== null && now - this.voiceProblemSince >= voiceStallTimeout) {
       void this.reconnect(problem)
+    }
+  }
+
+  /**
+   * Сверка адреса, с которого голосовой сервер получает звук бота. Если UDP-туннель VPN перестроился через другой
+   * сервер, а веб-сокет голосового соединения остался жив, адрес меняется, и бот заходит в канал заново: иначе Discord
+   * мог бы отбрасывать его звук, и никто бы этого не заметил. Если сервер на проверку не отвечает, она отключается
+   * до следующего соединения с ним
+   */
+  private async checkVoiceAddress(): Promise<void> {
+    const { state } = this.connection
+    if (this.destroyed || this.reconnecting || this.checkingUdp || state.status !== VoiceConnectionStatus.Ready) {
+      return
+    }
+
+    // Новое соединение с голосовым сервером: адрес в нём узнаём заново
+    const { networking } = state
+    if (this.udpCheck?.networking !== networking) {
+      this.udpCheck = { networking, address: null, misses: 0 }
+    }
+    const check = this.udpCheck
+    if (!check.address && check.misses >= UDP_CHECK_ATTEMPTS) {
+      return
+    }
+
+    this.checkingUdp = true
+    try {
+      const address = await discoverVoiceAddress(this.connection, this.timings.udpCheckTimeout)
+      // Пока ждали ответа, соединение могли пересоздать
+      if (this.destroyed || this.reconnecting || this.udpCheck !== check) {
+        return
+      }
+
+      if (!address) {
+        check.misses++
+        if (!check.address && check.misses === UDP_CHECK_ATTEMPTS) {
+          this.log.info('Проверка UDP: голосовой сервер не отвечает, до следующего соединения проверка отключена')
+        }
+        return
+      }
+
+      check.misses = 0
+      if (!check.address) {
+        check.address = address
+        this.log.info(`Проверка UDP: голосовой сервер получает звук бота с адреса ${address}`)
+      } else if (address !== check.address) {
+        void this.reconnect(`звук бота стал приходить в Discord с другого адреса (${check.address} -> ${address})`)
+      }
+    } finally {
+      this.checkingUdp = false
     }
   }
 

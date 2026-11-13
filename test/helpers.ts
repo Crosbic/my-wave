@@ -78,9 +78,54 @@ export interface FakeDave {
   session: { ready: boolean }
 }
 
+/**
+ * UDP-сокет голосового соединения. На запрос IP discovery отвечает адресом address, как голосовой сервер,
+ * а если address — null, молчит
+ */
+export class FakeUdp extends EventEmitter {
+  address: string | null = '203.0.113.10:50001'
+  requests = 0
+
+  send(packet: Buffer) {
+    if (packet.readUInt16BE(0) !== 1) {
+      return
+    }
+
+    this.requests++
+    if (!this.address) {
+      return
+    }
+
+    const [ip, port] = this.address.split(':')
+    const response = Buffer.alloc(74)
+    response.writeUInt16BE(2, 0)
+    response.writeUInt16BE(70, 2)
+    packet.copy(response, 4, 4, 8)
+    response.write(ip, 8)
+    response.writeUInt16BE(Number(port), 72)
+    setImmediate(() => this.emit('message', response))
+  }
+}
+
+// Время последнего heartbeat веб-сокета голосового соединения и ответа на него, 0 — ещё не было
+export interface FakeVoiceSocket {
+  lastHeartbeatSend: number
+  lastHeartbeatAck: number
+}
+
+interface FakeNetworking {
+  state: {
+    code: NetworkingStatusCode
+    dave: FakeDave
+    udp: FakeUdp
+    ws: FakeVoiceSocket
+    connectionData: { ssrc: number }
+  }
+}
+
 interface FakeConnectionState {
   status: VoiceConnectionStatus
-  networking?: { state: { code: NetworkingStatusCode; dave: FakeDave } }
+  networking?: FakeNetworking
 }
 
 interface FakeJoinConfig {
@@ -107,11 +152,23 @@ export class FakeVoiceConnection extends EventEmitter {
   }
   disconnects = 0
   rejoins: FakeJoinConfig[] = []
+  // Сколько следующих запросов на вход в канал не уйдёт: шлюз Discord переподключается
+  unavailable = 0
   private subscription: FakeSubscription | undefined
 
   // Сессия DAVE текущего соединения с голосовым сервером
   get dave(): FakeDave {
     return this.state.networking!.state.dave
+  }
+
+  // UDP-сокет текущего соединения с голосовым сервером
+  get udp(): FakeUdp {
+    return this.state.networking!.state.udp
+  }
+
+  // Веб-сокет текущего соединения с голосовым сервером
+  get ws(): FakeVoiceSocket {
+    return this.state.networking!.state.ws
   }
 
   subscribe(player: AudioPlayer) {
@@ -156,6 +213,11 @@ export class FakeVoiceConnection extends EventEmitter {
 
     this.rejoins.push({ ...config })
     Object.assign(this.joinConfig, config)
+    if (config.channelId && this.unavailable > 0) {
+      this.unavailable--
+      this.setState({ status: VoiceConnectionStatus.Disconnected })
+      return false
+    }
     if (this.state.status !== VoiceConnectionStatus.Ready) {
       this.setState({ status: VoiceConnectionStatus.Signalling })
     }
@@ -186,14 +248,16 @@ export class FakeVoiceConnection extends EventEmitter {
   }
 }
 
-function fakeNetworking() {
+function fakeNetworking(): FakeNetworking {
   const dave: FakeDave = { protocolVersion: 1, reinitializing: false, session: { ready: true } }
-  return { state: { code: NetworkingStatusCode.Ready, dave } }
+  const ws: FakeVoiceSocket = { lastHeartbeatSend: 0, lastHeartbeatAck: 0 }
+  return { state: { code: NetworkingStatusCode.Ready, dave, udp: new FakeUdp(), ws, connectionData: { ssrc: 4242 } } }
 }
 
-// Ускоренные тайминги: проверка активности отключена, повторы и подтверждение старта — быстрые
+// Ускоренные тайминги: проверки активности и UDP-адреса отключены, повторы и подтверждение старта — быстрые
 export const FAST_TIMINGS: Partial<WaveTimings> = {
   activityCheckInterval: 60_000,
+  udpCheckInterval: 60_000,
   retryDelay: 30,
   startConfirmDelay: 100
 }

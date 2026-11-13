@@ -1,5 +1,6 @@
 import {
   DAVESession,
+  NetworkingStatusCode,
   VoiceConnection,
   VoiceConnectionDisconnectReason,
   VoiceConnectionState,
@@ -14,6 +15,10 @@ const DAVE_DEBUG_PREFIX = '[NW] [DAVE] '
 const DAVE_FAILURE = /errored|Invalidating|don't have a pending|downgraded/
 // Голосовой сервер выполняет смену ключей, о которой бот не знает: он пропустил коммит MLS
 const MISSED_TRANSITION = "Received execute transition, but we don't have a pending transition"
+// Пакет IP discovery: тип (1 — запрос, 2 — ответ), длина остатка, SSRC, адрес строкой в 64 байтах и порт
+const DISCOVERY_SIZE = 74
+const DISCOVERY_REQUEST = 1
+const DISCOVERY_RESPONSE = 2
 
 /**
  * Сообщение DAVE из отладочного лога голосового соединения или null. Остальные отладочные сообщения @discordjs/voice
@@ -74,11 +79,75 @@ export function voiceProblem(connection: VoiceConnection): string | null {
 }
 
 /**
+ * Голосовой сервер не ответил на heartbeat за timeout мс: веб-сокет голосового соединения, скорее всего, завис,
+ * например на маршруте VPN, который перестал работать. Обычно ответ приходит за доли секунды
+ */
+export function isVoiceSocketStalled(connection: VoiceConnection, timeout: number, now = Date.now()): boolean {
+  const { state } = connection
+  if (state.status !== VoiceConnectionStatus.Ready || state.networking.state.code !== NetworkingStatusCode.Ready) {
+    return false
+  }
+
+  // Время отправки heartbeat и ответа на него @discordjs/voice хранит, но в типах не открывает
+  const ws = state.networking.state.ws as unknown as { lastHeartbeatSend?: number; lastHeartbeatAck?: number }
+  const sent = ws.lastHeartbeatSend ?? 0
+  const acknowledged = ws.lastHeartbeatAck ?? 0
+  return sent > 0 && acknowledged < sent && now - sent > timeout
+}
+
+/**
  * Бот в группе сквозного шифрования, и его ключи согласованы с остальными участниками
  */
 export function isDaveActive(connection: VoiceConnection): boolean {
   const dave = daveSession(connection)
   return !!dave?.session?.ready && !dave.reinitializing
+}
+
+/**
+ * Адрес, с которого голосовой сервер Discord получает звук бота: ответ на запрос IP discovery по UDP,
+ * как при подключении. Если UDP-туннель VPN перестроится через другой сервер, адрес сменится, хотя веб-сокет
+ * голосового соединения жив. null — соединение не готово или сервер не ответил за timeout мс
+ */
+export function discoverVoiceAddress(connection: VoiceConnection, timeout: number): Promise<string | null> {
+  const { state } = connection
+  if (state.status !== VoiceConnectionStatus.Ready || state.networking.state.code !== NetworkingStatusCode.Ready) {
+    return Promise.resolve(null)
+  }
+
+  const { udp, connectionData } = state.networking.state
+  const request = Buffer.alloc(DISCOVERY_SIZE)
+  request.writeUInt16BE(DISCOVERY_REQUEST, 0)
+  request.writeUInt16BE(DISCOVERY_SIZE - 4, 2)
+  request.writeUInt32BE(connectionData.ssrc, 4)
+
+  return new Promise(resolve => {
+    const onMessage = (message: Buffer) => {
+      if (
+        message.length !== DISCOVERY_SIZE ||
+        message.readUInt16BE(0) !== DISCOVERY_RESPONSE ||
+        message.readUInt32BE(4) !== connectionData.ssrc
+      ) {
+        return
+      }
+      const end = message.indexOf(0, 8)
+      const ip = message.subarray(8, end === -1 ? DISCOVERY_SIZE - 2 : end).toString('utf8')
+      finish(`${ip}:${message.readUInt16BE(DISCOVERY_SIZE - 2)}`)
+    }
+    const finish = (address: string | null) => {
+      clearTimeout(timer)
+      udp.off('message', onMessage)
+      resolve(address)
+    }
+    const timer = setTimeout(() => finish(null), timeout)
+
+    udp.on('message', onMessage)
+    try {
+      udp.send(request)
+    } catch {
+      // Сокет уже закрыт: соединение меняется прямо сейчас
+      finish(null)
+    }
+  })
 }
 
 /**

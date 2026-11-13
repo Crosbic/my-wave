@@ -14,6 +14,7 @@ import {
   createTestSession,
   embedDescription,
   FAST_TIMINGS,
+  FakeVoiceConnection,
   playerStatus,
   removeDir,
   runningProcesses,
@@ -612,6 +613,9 @@ describe('WaveSession: голосовое соединение', () => {
   const WATCHED: Partial<WaveTimings> = { activityCheckInterval: 50, voiceStallTimeout: 300 }
   const MISSED_TRANSITION = "[NW] [DAVE] Received execute transition, but we don't have a pending transition for 5"
 
+  // Сколько раз бот просил Discord подключить его к каналу
+  const joins = (connection: FakeVoiceConnection) => connection.rejoins.filter(config => config.channelId).length
+
   async function playingSession(t: TestContext, timings: Partial<WaveTimings> = {}) {
     const yandexStub = stubYandex(t, { batches: [batch('b1', '11', '12')], clip: 'long' })
     const test = startedSession(t, {}, timings)
@@ -635,12 +639,51 @@ describe('WaveSession: голосовое соединение', () => {
     assert.ok(!isDestroyed())
   })
 
-  it('если зайти в канал заново не удалось, плеер останавливается с понятной причиной', async t => {
-    const { session, connection, isDestroyed } = await playingSession(t, { connectTimeout: 300 })
+  it('если зайти в канал заново так и не удалось, плеер останавливается с понятной причиной', async t => {
+    const { session, connection, isDestroyed } = await playingSession(t, {
+      connectTimeout: 150,
+      rejoinDelay: 20,
+      voiceRecoveryTimeout: 500
+    })
 
     connection.resume()
     await waitFor(isDestroyed, 'плеер остановлен')
     assert.equal(session.stopReason, 'Соединение с голосовым каналом потеряно.')
+    assert.ok(joins(connection) >= 2, 'бот пробовал зайти в канал несколько раз')
+  })
+
+  it('пока шлюз Discord переподключается, бот пробует зайти в канал снова', async t => {
+    const { session, connection, isDestroyed } = await playingSession(t, { rejoinDelay: 20 })
+
+    // Запросы на вход в канал не уходят, пока шлюз Discord не переподключится
+    connection.unavailable = 2
+    connection.resume()
+    await waitFor(
+      () => connection.unavailable === 0 && connection.state.status === VoiceConnectionStatus.Signalling,
+      'третья попытка дошла до Discord'
+    )
+
+    connection.ready()
+    await waitFor(() => playerStatus(session) === 'playing', 'трек играет дальше')
+    assert.equal(joins(connection), 3)
+    assert.ok(!isDestroyed())
+  })
+
+  it('если голосовой сервер не отвечает на heartbeat, бот заходит в канал заново, не дожидаясь @discordjs/voice', async t => {
+    const { connection } = await playingSession(t, { ...WATCHED, heartbeatTimeout: 300 })
+
+    // На последний heartbeat сервер ответил
+    connection.ws.lastHeartbeatSend = Date.now() - 1_000
+    connection.ws.lastHeartbeatAck = Date.now() - 900
+    await sleep(200)
+    assert.equal(connection.rejoins.length, 0)
+
+    // Новый heartbeat только что ушёл: ответа пока нет, но время ещё не вышло
+    connection.ws.lastHeartbeatSend = Date.now()
+    await sleep(150)
+    assert.equal(connection.rejoins.length, 0)
+
+    await waitFor(() => connection.rejoins.length === 1, 'бот зашёл в канал заново')
   })
 
   it('если сквозное шифрование долго не готово, бот заходит в канал заново', async t => {
@@ -700,5 +743,45 @@ describe('WaveSession: голосовое соединение', () => {
     await waitFor(isDestroyed, 'плеер остановлен')
     assert.equal(session.stopReason, 'Соединение с голосовым каналом постоянно обрывается.')
     assert.equal(connection.rejoins.length, 5)
+  })
+})
+
+describe('WaveSession: адрес, с которого Discord получает звук бота', () => {
+  // Адрес сверяется часто, а ответа ждём недолго
+  const UDP_CHECKED: Partial<WaveTimings> = { udpCheckInterval: 50, udpCheckTimeout: 50 }
+
+  async function start(t: TestContext, prepare: (connection: FakeVoiceConnection) => void = () => {}) {
+    const yandexStub = stubYandex(t, { batches: [batch('b1', '11', '12')], clip: 'long' })
+    const test = startedSession(t, {}, UDP_CHECKED)
+    prepare(test.connection)
+    await test.session.start()
+    await waitForStart(test.session, yandexStub.started, '11')
+    return test
+  }
+
+  it('если UDP-туннель перестроился через другой сервер, бот заходит в канал заново', async t => {
+    const { connection } = await start(t)
+    await waitFor(() => connection.udp.requests >= 2, 'адрес сверен')
+    assert.equal(connection.rejoins.length, 0, 'пока адрес прежний, всё в порядке')
+
+    // Веб-сокет голосового соединения жив, а звук идёт в Discord уже с другого сервера VPN
+    connection.udp.address = '198.51.100.7:41234'
+    await waitFor(() => connection.rejoins.length === 1, 'бот зашёл в канал заново')
+
+    connection.ready()
+    await waitFor(() => connection.udp.requests >= 2, 'адрес нового соединения сверен')
+    assert.equal(connection.rejoins.length, 1, 'в новом соединении адрес узнаётся заново')
+  })
+
+  it('если голосовой сервер не отвечает на проверку, она отключается, а бот играет дальше', async t => {
+    const { session, connection } = await start(t, connection => {
+      connection.udp.address = null
+    })
+
+    await waitFor(() => connection.udp.requests >= 3, 'три проверки без ответа')
+    await sleep(300)
+    assert.equal(connection.udp.requests, 3, 'больше адрес в этом соединении не проверяется')
+    assert.equal(connection.rejoins.length, 0)
+    assert.equal(playerStatus(session), 'playing')
   })
 })
